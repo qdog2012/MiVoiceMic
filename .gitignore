@@ -1,0 +1,19 @@
+# build artifacts
+MiVoiceMic.exe
+MiVoiceMic.new.exe
+
+# runtime artifacts
+MiVoiceMic.log
+dump_*.wav
+config.json
+
+# scratch screenshots (docs/screenshots is the curated set)
+shots/
+
+# reference copies of third-party projects (fetched separately, see README credits)
+reference/
+
+# misc
+*.user
+.vs/
+tools/*.exe
