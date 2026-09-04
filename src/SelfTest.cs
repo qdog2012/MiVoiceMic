@@ -1,5 +1,5 @@
 // SelfTest.cs - offline logic tests (run with: MiVoiceMic.exe --selftest)
-// 中文：离线单元测试 —— 解码/配置/手势引擎/钩子判定（31 项）
+// 中文：离线单元测试 —— 解码/配置/手势引擎/钩子判定/充电状态解析/按键归因（45 项）
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -24,6 +24,8 @@ static class SelfTest {
         TestWavWriter();
         TestF5Blocker();
         TestKeyMap();
+        TestChargeState();
+        TestLooksFromRemote();
         Console.WriteLine("== " + passed + " passed, " + failed + " failed ==");
         return failed == 0 ? 0 : 1;
     }
@@ -240,5 +242,46 @@ static class SelfTest {
         eng.Feed(0x0D, false, 5200, outc);                        // released early -> click (tap combo = single fire)
         Check(outc.Count == 1 && outc[0].Phase == GestureEngine.Phase.Once && outc[0].Action.keys == "LALT+TAB",
             "gesture: early release taps click combo");
+    }
+
+    static void TestChargeState() {
+        // 00 61 00: RC003 real-device sample (reference/remote-mic-app bug doc 2026-08-08)
+        Check(BleVoiceLink.ParseChargeState(new byte[] { 0x00, 0x61, 0x00 }) == BleVoiceLink.CHG_DISCHARGING,
+            "2BED 00 61 00 -> 未充电");
+        Check(BleVoiceLink.ParseChargeState(new byte[] { 0x00, 0x21, 0x00 }) == BleVoiceLink.CHG_CHARGING,
+            "2BED 00 21 00 -> 充电中");
+        Check(BleVoiceLink.ParseChargeState(new byte[] { 0x00, 0x01, 0x00 }) == BleVoiceLink.CHG_UNKNOWN,
+            "2BED charge-state=unknown -> 未知");
+        Check(BleVoiceLink.ParseChargeState(new byte[] { 0x00, 0x61 }) == BleVoiceLink.CHG_UNKNOWN,
+            "2BED short frame rejected");
+        Check(BleVoiceLink.ParseChargeState(null) == BleVoiceLink.CHG_UNKNOWN,
+            "2BED null rejected");
+        Check(BleVoiceLink.ChargeText(BleVoiceLink.CHG_CHARGING) == "充电中" &&
+              BleVoiceLink.ChargeText(BleVoiceLink.CHG_DISCHARGING) == "未充电" &&
+              BleVoiceLink.ChargeText(BleVoiceLink.CHG_UNKNOWN) == "未知",
+            "charge text mapping");
+    }
+
+    static void TestLooksFromRemote() {
+        // mapped-key device decision: latest speaker wins, no evidence -> remote
+        RawSink.SeedEvidence(-1, -1);
+        Check(RawSink.LooksFromRemote(), "无证据（连接后第一按）-> 遥控器");
+        RawSink.SeedEvidence(300, -1);
+        Check(RawSink.LooksFromRemote(), "遥控器 300ms 前按过 -> 遥控器");
+        RawSink.SeedEvidence(-1, 300);
+        Check(!RawSink.LooksFromRemote(), "只有物理键盘 300ms 前按过 -> 物理键");
+        RawSink.SeedEvidence(500, 100);
+        Check(!RawSink.LooksFromRemote(), "物理键盘(100ms)比遥控器(500ms)新 -> 物理键");
+        RawSink.SeedEvidence(100, 500);
+        Check(RawSink.LooksFromRemote(), "遥控器(100ms)比物理键盘(500ms)新 -> 遥控器");
+        RawSink.SeedEvidence(5000, 5000);
+        Check(RawSink.LooksFromRemote(), "双方证据都过期 -> 遥控器（映射已启用）");
+        RawSink.SeedEvidence(-1, 5000);
+        Check(RawSink.LooksFromRemote(), "物理键盘证据过期 -> 遥控器");
+        RawSink.SeedEvidence(2100, 2500);
+        Check(RawSink.LooksFromRemote(), "双方证据都过期(2100/2500ms) -> 遥控器（默认）");
+        RawSink.SeedEvidence(2100, 100);
+        Check(!RawSink.LooksFromRemote(), "遥控器证据过期但物理键盘新鲜 -> 物理键");
+        RawSink.SeedEvidence(-1, -1);   // leave the clean default for other tests
     }
 }

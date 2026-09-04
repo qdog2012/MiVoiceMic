@@ -15,6 +15,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.Foundation;
@@ -31,6 +32,13 @@ sealed class BleVoiceLink {
     static readonly Guid C_CTL = new Guid("ab5e0004-5a21-4f05-bc7d-af01f617b664");
     static readonly Guid SVC_BATTERY = new Guid("0000180f-0000-1000-8000-00805f9b34fb");
     static readonly Guid CHR_BATTERY = new Guid("00002a19-0000-1000-8000-00805f9b34fb");
+    static readonly Guid CHR_BATT_STATUS = new Guid("00002bed-0000-1000-8000-00805f9b34fb");
+
+    // 2BED Battery Level Status (BAS v1.1) -> charge state for the UI.
+    // Exposed by the RC003 (2 Pro) only; RC001-style remotes report CHG_UNKNOWN.
+    public const int CHG_UNKNOWN = -1;
+    public const int CHG_DISCHARGING = 0;
+    public const int CHG_CHARGING = 1;
 
     // ATVV opcodes
     const byte OP_AUDIO_STOP = 0x00;    // ctl: audio stop (any reason)
@@ -48,6 +56,7 @@ sealed class BleVoiceLink {
         void OnSync(int predictor, int stepIndex);
         void OnAudioFrame(byte[] frame);
         void OnBattery(int percent);
+        void OnCharging(int chargeState);
     }
 
     readonly Config cfg;
@@ -61,19 +70,23 @@ sealed class BleVoiceLink {
 
     volatile bool linked;
     volatile bool micOpen;
+    volatile bool chargeHooked;
     int version;             // ATVV protocol version from CAPS
     int frameSize = 120;
     int codec = 2;           // 2 = 16 kHz
     byte sessionId;
     Timer keepalive;
+    int keepTicks;
 
     public bool Linked { get { return linked; } }
     public string RemoteName { get; private set; }
     public int Battery { get; private set; }
+    public int Charging { get; private set; }
 
     public BleVoiceLink(Config cfg, IHandler handler) {
         this.cfg = cfg;
         this.handler = handler;
+        Charging = CHG_UNKNOWN;
     }
 
     public void Start() {
@@ -156,7 +169,9 @@ sealed class BleVoiceLink {
         } catch (Exception ex) {
             Log.Warn("[ATVV] keepalive failed: " + ex.Message + " -> reconnect");
             ScheduleReconnect();
+            return;
         }
+        if (++keepTicks % 12 == 0) TryReadBattery();   // 12 x 5s: refresh battery/charging each minute
     }
 
     void ScheduleReconnect() {
@@ -347,14 +362,66 @@ sealed class BleVoiceLink {
             svcBattery = bsvc;
             var chRes = await AsT(bsvc.GetCharacteristicsAsync(BluetoothCacheMode.Cached));
             var bc = chRes.Characteristics.FirstOrDefault(c => c.Uuid == CHR_BATTERY);
-            if (bc == null) return;
-            var read = await AsT(bc.ReadValueAsync());
-            if (read.Status == GattCommunicationStatus.Success && read.Value.Length >= 1) {
-                var b = ToBytes(read.Value);
-                Battery = b[0];
-                handler.OnBattery(Battery);
+            if (bc != null) {
+                var read = await AsT(bc.ReadValueAsync());
+                if (read.Status == GattCommunicationStatus.Success && read.Value.Length >= 1) {
+                    var b = ToBytes(read.Value);
+                    Battery = b[0];
+                    handler.OnBattery(Battery);
+                }
             }
+            var cc = chRes.Characteristics.FirstOrDefault(c => c.Uuid == CHR_BATT_STATUS);
+            if (cc == null) return;               // RC001-style: no charging info
+            var cs = await AsT(cc.ReadValueAsync());
+            if (cs.Status == GattCommunicationStatus.Success) {
+                var b = ToBytes(cs.Value);
+                int st = ParseChargeState(b);
+                Charging = st;
+                Log.Info("[BAT] 充电状态: " + ChargeText(st) + " (2BED=" + HexStr(b) + ")");
+                handler.OnCharging(st);
+            }
+            if (!chargeHooked) {                  // subscribe after the first read so a
+                chargeHooked = true;              // slow/hung CCCD write can't delay it
+                try {
+                    if ((cc.CharacteristicProperties & GattCharacteristicProperties.Notify) != 0) {
+                        HookValueChanged(cc, ChargeHandler);
+                        var sub = await AsT(cc.WriteClientCharacteristicConfigurationDescriptorAsync(
+                            GattClientCharacteristicConfigurationDescriptorValue.Notify));
+                        Log.Info("[BAT] 2BED notify subscribed: " + sub);
+                    } else {
+                        Log.Info("[BAT] 2BED has no notify property - polling every 60s");
+                    }
+                } catch (Exception ex) { Log.Warn("[BAT] 2BED subscribe: " + ex.Message); }
+            }
+        } catch (Exception ex) { Log.Warn("[BAT] read: " + ex.Message); }
+    }
+
+    void ChargeHandler(GattCharacteristic sender, GattValueChangedEventArgs e) {
+        try {
+            byte[] b = ToBytes(e.CharacteristicValue);
+            Log.Info("[BAT] 2BED notify: " + HexStr(b) + " -> " + ChargeText(ParseChargeState(b)));
+            TryReadBattery();            // refresh % alongside the charge-state change
         } catch { }
+    }
+
+    // BAS v1.1 Power State (little-endian): bit0 battery present, bits1-2 wired
+    // ext power, bits3-4 wireless ext power, bits5-6 charge state (1=charging,
+    // 2/3=discharging). Verified against a real RC003: 00 61 00 -> discharging.
+    internal static int ParseChargeState(byte[] b) {
+        if (b == null || b.Length < 3) return CHG_UNKNOWN;
+        int ps = b[1] | (b[2] << 8);
+        int charge = (ps >> 5) & 3;
+        return charge == 1 ? CHG_CHARGING : (charge >= 2 ? CHG_DISCHARGING : CHG_UNKNOWN);
+    }
+
+    internal static string ChargeText(int st) {
+        return st == CHG_CHARGING ? "充电中" : st == CHG_DISCHARGING ? "未充电" : "未知";
+    }
+
+    static string HexStr(byte[] b) {
+        var sb = new StringBuilder(b.Length * 3);
+        for (int i = 0; i < b.Length; i++) sb.Append(b[i].ToString("X2")).Append(' ');
+        return sb.ToString().TrimEnd();
     }
 
     // ======================= notification handlers =======================
@@ -455,6 +522,7 @@ sealed class BleVoiceLink {
     void Cleanup() {
         linked = false;
         micOpen = false;
+        chargeHooked = false;
         InputRouter.SetLinked(false);
         if (device != null) {
             try { device.ConnectionStatusChanged -= OnConnectionChanged; } catch { }

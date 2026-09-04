@@ -250,4 +250,9 @@ sealed class App : BleVoiceLink.IHandler {
         UiState.SetBattery(percent);
         TrayIcon.SetBattery(percent);
     }
+
+    public void OnCharging(int chargeState) {
+        UiState.SetCharging(chargeState);
+        TrayIcon.SetCharging(chargeState);
+    }
 }

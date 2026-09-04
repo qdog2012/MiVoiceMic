@@ -322,7 +322,8 @@ class ConnectPage : MacPage {
         infoY += MacTheme.S(34);
 
         if (s.Battery >= 0) {
-            Gfx.Text(g, "电量 " + s.Battery + "%", bodyFont, MacTheme.TextSecondary,
+            bool charging = s.Charging == 1;
+            Gfx.Text(g, "电量 " + s.Battery + "%" + (charging ? " · 充电中" : ""), bodyFont, MacTheme.TextSecondary,
                 new RectangleF(MacTheme.S(16), infoY, w - MacTheme.S(32), MacTheme.S(18)), StringAlignment.Center);
             var bar = new RectangleF(MacTheme.S(40), infoY + MacTheme.S(22), w - MacTheme.S(80), MacTheme.S(8));
             using (var path = Gfx.RoundRect(new Rectangle((int)bar.X, (int)bar.Y, (int)bar.Width, (int)bar.Height), MacTheme.S(4))) {
@@ -332,7 +333,8 @@ class ConnectPage : MacPage {
             if (fillW > 2) {
                 var fill = new RectangleF(bar.X, bar.Y, fillW, bar.Height);
                 using (var path = Gfx.RoundRect(new Rectangle((int)fill.X, (int)fill.Y, (int)fill.Width, (int)fill.Height), MacTheme.S(4))) {
-                    Color bc = s.Battery <= 15 ? MacTheme.Red : s.Battery <= 30 ? MacTheme.Yellow : MacTheme.Green;
+                    Color bc = charging ? MacTheme.Green
+                        : s.Battery <= 15 ? MacTheme.Red : s.Battery <= 30 ? MacTheme.Yellow : MacTheme.Green;
                     using (var b = new SolidBrush(bc)) g.FillPath(b, path);
                 }
             }

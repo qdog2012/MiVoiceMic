@@ -57,6 +57,7 @@ static class UiState {
     static string statusText = "启动中...";
     static string deviceName = "";
     static int battery = -1;
+    static int charging = -1;             // -1 unknown, 0 no, 1 charging (2BED)
     static bool talking;
     static double level;                  // 0..1 voice level
     static long version;                  // bumped on every change
@@ -70,19 +71,20 @@ static class UiState {
         }
     }
     public static void SetBattery(int percent) { lock (gate) { battery = percent; version++; } }
+    public static void SetCharging(int state) { lock (gate) { charging = state; version++; } }
     public static void SetTalking(bool on) { lock (gate) { talking = on; if (!on) level = 0; version++; } }
     public static void SetLevel(double v) { lock (gate) { level = v; version++; } }
 
     public struct Snapshot {
         public bool Linked; public string Status, Device; public int Battery;
-        public bool Talking; public double Level; public long Version;
+        public int Charging; public bool Talking; public double Level; public long Version;
     }
 
     public static Snapshot Take() {
         lock (gate) {
             Snapshot s;
             s.Linked = linkedFlag; s.Status = statusText; s.Device = deviceName;
-            s.Battery = battery; s.Talking = talking; s.Level = level; s.Version = version;
+            s.Battery = battery; s.Charging = charging; s.Talking = talking; s.Level = level; s.Version = version;
             return s;
         }
     }

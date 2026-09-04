@@ -23,6 +23,7 @@ static class TrayIcon {
     static volatile string statusText = "启动中...";
     static volatile bool linkedFlag;
     static volatile int battery = -1;
+    static volatile int charging = -1;
     static volatile bool dirty = true;
 
     public static NotifyIcon Create(App application) {
@@ -175,15 +176,20 @@ static class TrayIcon {
         lock (gate) { battery = percent; dirty = true; }
     }
 
+    /// Called from any thread.
+    public static void SetCharging(int state) {
+        lock (gate) { charging = state; dirty = true; }
+    }
+
     static void ApplyPending() {
         if (!dirty) return;
-        string st; bool linked; int bat;
+        string st; bool linked; int bat; int chg;
         lock (gate) {
-            st = statusText; linked = linkedFlag; bat = battery;
+            st = statusText; linked = linkedFlag; bat = battery; chg = charging;
             dirty = false;
         }
         miStatus.Text = "状态: " + st;
-        if (bat >= 0) { miBattery.Visible = true; miBattery.Text = "电量: " + bat + "%"; }
+        if (bat >= 0) { miBattery.Visible = true; miBattery.Text = "电量: " + bat + "%" + (chg == 1 ? " (充电中)" : ""); }
     }
 }
 

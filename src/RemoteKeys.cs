@@ -80,7 +80,7 @@ static class InputRouter {
                     if (mappingEnabled) lock (mapGate) mapCase = engine.HasBinding(vk);
                 if (f5Case || mapCase) {
                     bool remote = true;
-                    if (mapCase) remote = RawSink.IsFromRemote(vk, down, k.time);
+                    if (mapCase) remote = RawSink.LooksFromRemote();
                     if (remote) {
                         Interlocked.Increment(ref SwallowedCount);
                         if (mapCase) mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = down, TickMs = NowMs() });
@@ -94,7 +94,8 @@ static class InputRouter {
                     if (t - lastPassLogTick > 2000 || t < lastPassLogTick) {
                         lastPassLogTick = t;
                         Log.Info("[INPUT] 0x" + vk.ToString("X2") + (down ? " 按下" : " 松开") +
-                                 " 已映射但未归因遥控器 → 放行（物理键）");
+                                 " 已映射但最近物理键盘更活跃 → 放行" +
+                                 (mapCase ? " 证据=" + RawSink.LastProbe : ""));
                     }
                 }
                 }
@@ -110,7 +111,6 @@ static class InputRouter {
         var k = new KBDLLHOOKSTRUCT { vkCode = vk };
         IntPtr mem = Marshal.AllocHGlobal(Marshal.SizeOf(k));
         try {
-            if (fromRemote) RawSink.SeedForTest(vk, down);
             Marshal.StructureToPtr(k, mem, false);
             return HookCb(0, (IntPtr)(down ? 0x0100 : 0x0101), mem);
         } finally { Marshal.FreeHGlobal(mem); }
@@ -466,7 +466,7 @@ static class RawSink {
 
     const uint WM_INPUT = 0x00FF;
     const uint RIDEV_INPUTSINK = 0x00000100;
-    const uint RID_INPUT = 0x100000;
+    const uint RID_INPUT = 0x10000003;         // NOT 0x100000 - winuser.h RID_INPUT; the wrong value made GetRawInputData always fail with -1
     const uint RIDI_DEVICENAME = 0x20000007;   // NOT 0x20000003 - the wrong value made every query fail
 
     [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
@@ -483,13 +483,21 @@ static class RawSink {
     static string macPrefix = "";
     static List<string> matchers = BuildMatchers(vidPid, macPrefix);
 
-    // correlation ring
+    // correlation ring (diagnostics) + device-evidence clocks (decision).
+    // WM_INPUT for a key is posted only AFTER the LL hook chain returns, so the
+    // hook can never correlate the CURRENT key - it decides from which device
+    // spoke most recently (injected events, hDevice=0, vote for neither side).
     struct Rec { public ushort Vk; public bool Down; public long Tick; public bool Remote; }
     const int RING = 64;
     static readonly Rec[] ring = new Rec[RING];
     static int ringHead;                                    // next write slot
     static readonly object ringGate = new object();
     static readonly Dictionary<IntPtr, bool> deviceCache = new Dictionary<IntPtr, bool>();
+    static long lastRemoteTick;                             // last WM_INPUT from the remote
+    static long lastForeignTick;                            // last WM_INPUT from any real non-remote keyboard
+    const long EVIDENCE_FRESH_MS = 2000;                    // older evidence stops voting
+
+    static long NowMs() { return DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond; }
 
     /// <param name="vidPidList">Config entries like "2717:32B8" (hex, "0x" ok).</param>
     /// <param name="macPrefix">Optional BLE MAC prefix like "C0:5D:39" - the raw
@@ -546,7 +554,15 @@ static class RawSink {
             wc.hInstance = GetModuleHandle(null);
             wc.lpszClassName = "MivmRawSink";
             RegisterClassW(ref wc);
-            hwnd = CreateWindowEx(0, "MivmRawSink", "", 0, 0, 0, 0, 0, (IntPtr)(-3) /*HWND_MESSAGE*/, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+            // MUST be a normal top-level window, NOT a HWND_MESSAGE message-only
+            // window: the raw input system never posts WM_INPUT to message-only
+            // windows (classic Win32 trap - the ring silently stays empty and
+            // every mapped key then looks like it came from a physical keyboard).
+            // Hidden (style 0) + RIDEV_INPUTSINK = delivers without focus; the
+            // tool-window/no-activate ex styles keep it out of taskbar & Alt-Tab.
+            const uint WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000;
+            hwnd = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                "MivmRawSink", "", 0, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
             if (hwnd == IntPtr.Zero) { Log.Error("[INPUT] raw sink window failed: " + Marshal.GetLastWin32Error()); return; }
             var rid = new RAWINPUTDEVICE[1];
             rid[0].usUsagePage = 1; rid[0].usUsage = 6;       // generic desktop / keyboard
@@ -554,6 +570,8 @@ static class RawSink {
             rid[0].hwndTarget = hwnd;
             if (!RegisterRawInputDevices(rid, 1, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE))))
                 Log.Error("[INPUT] RegisterRawInputDevices failed: " + Marshal.GetLastWin32Error());
+            else
+                Log.Info("[INPUT] raw sink hwnd=0x" + hwnd.ToString("X") + " registered (top-level, INPUTSINK)");
             LogRawKeyboards();
             MSG m;
             while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { TranslateMessage(ref m); DispatchMessage(ref m); }
@@ -567,31 +585,49 @@ static class RawSink {
 
     static IntPtr SinkProc(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam) {
         if (msg == WM_INPUT) {
-            uint size = 0;
-            GetRawInputData(lParam, RID_INPUT, IntPtr.Zero, ref size, (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER)));
-            if (size > 0 && size <= 512) {
-                IntPtr buf = Marshal.AllocHGlobal((int)size);
-                try {
-                    if (GetRawInputData(lParam, RID_INPUT, buf, ref size, (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER))) == size) {
-                        var raw = (RAWINPUT)Marshal.PtrToStructure(buf, typeof(RAWINPUT));
-                        if (raw.header.dwType == 1) {          // RIM_TYPEKEYBOARD
-                            bool down = raw.keyboard.Message == 0x0100 || raw.keyboard.Message == 0x0104;
-                            bool remote = DeviceIsRemote(raw.header.hDevice);
-                            long tick = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
-                            lock (ringGate) {
-                                ring[ringHead].Vk = raw.keyboard.VKey;
-                                ring[ringHead].Down = down;
-                                ring[ringHead].Tick = tick;
-                                ring[ringHead].Remote = remote;
-                                ringHead = (ringHead + 1) % RING;
-                            }
+            // single call with a fixed buffer - the pData=NULL size probe of
+            // GetRawInputData fails outright (same disease as RIDI_DEVICENAME's
+            // NULL probe, fixed 2026-09-03); keyboard RAWINPUT is 48 bytes
+            IntPtr buf = Marshal.AllocHGlobal(256);
+            try {
+                uint hdr = (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER));
+                uint size = 256;
+                uint got = GetRawInputData(lParam, RID_INPUT, buf, ref size, hdr);
+                if (got != unchecked((uint)-1) && got >= hdr) {
+                    var raw = (RAWINPUT)Marshal.PtrToStructure(buf, typeof(RAWINPUT));
+                    if (raw.header.dwType == 1) {              // RIM_TYPEKEYBOARD
+                        bool down = raw.keyboard.Message == 0x0100 || raw.keyboard.Message == 0x0104;
+                        bool remote = DeviceIsRemote(raw.header.hDevice);
+                        long tick = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
+                        lock (ringGate) {
+                            ring[ringHead].Vk = raw.keyboard.VKey;
+                            ring[ringHead].Down = down;
+                            ring[ringHead].Tick = tick;
+                            ring[ringHead].Remote = remote;
+                            ringHead = (ringHead + 1) % RING;
+                            if (remote) lastRemoteTick = tick;
+                            else if (raw.header.hDevice != IntPtr.Zero) lastForeignTick = tick;
+                        }
+                        int t = Environment.TickCount;         // diagnosis: remote keys only - otherwise every physical keystroke floods the log
+                        if (remote && (t - lastEvtLog > 400 || t < lastEvtLog)) {
+                            lastEvtLog = t;
+                            Log.Info("[INPUT] wm_input vk=0x" + raw.keyboard.VKey.ToString("X2") +
+                                     (down ? " down" : " up") + " dev=0x" + raw.header.hDevice.ToString("X") +
+                                     " remote=" + (remote ? 1 : 0));
                         }
                     }
-                } finally { Marshal.FreeHGlobal(buf); }
-            }
+                } else {
+                    int t = Environment.TickCount;
+                    if (t - lastEvtLog > 400 || t < lastEvtLog) {
+                        lastEvtLog = t;
+                        Log.Info("[INPUT] wm_input parse FAIL got=" + got + " size=" + size);
+                    }
+                }
+            } finally { Marshal.FreeHGlobal(buf); }
         }
         return DefWindowProcW(h, msg, wParam, lParam);
     }
+    static int lastEvtLog;                                     // rawsink thread only
 
     static bool DeviceIsRemote(IntPtr hDevice) {
         if (hDevice == IntPtr.Zero) return false;             // SendInput injections
@@ -599,51 +635,66 @@ static class RawSink {
             bool cached;
             if (deviceCache.TryGetValue(hDevice, out cached)) return cached;
             bool remote = false;
+            string path = "";
+            int r = -1;
             try {
                 // no NULL size-probe here: RIDI_DEVICENAME with pData=NULL fails
                 // outright - a big-enough buffer must be passed in one call
                 var sb = new System.Text.StringBuilder(512);
                 uint sz = (uint)sb.Capacity;
-                uint r = GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, sb, ref sz);
-                if (r != unchecked((uint)-1) && r > 0) {
-                    string path = sb.ToString().ToLowerInvariant();
+                r = unchecked((int)GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, sb, ref sz));
+                if (r != -1 && r > 0) {
+                    path = sb.ToString().ToLowerInvariant();
                     foreach (string m in matchers)
                         if (path.IndexOf(m) >= 0) { remote = true; break; }
                 }
             } catch { }
             deviceCache[hDevice] = remote;
+            // first time this handle is seen after (re)connection: log the verdict -
+            // a BLE remote gets a new handle each reconnect, so this line tracks it
+            Log.Info("[INPUT] attrib dev=0x" + hDevice.ToString("X") + " r=" + r +
+                     " remote=" + (remote ? 1 : 0) + " path=" + path);
             return remote;
         }
     }
 
-    /// Correlate a hook event against recent raw input. Bounded wait (max ~8ms)
-    /// because WM_INPUT may reach the sink thread slightly after the hook fires.
-    public static bool IsFromRemote(uint vk, bool down, uint llTime) {
-        long start = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
-        for (int attempt = 0; attempt < 12; attempt++) {
-            lock (ringGate) {
-                int newest = (ringHead - 1 + RING) % RING;
-                for (int i = 0; i < RING; i++) {
-                    int idx = (newest - i + RING * 2) % RING;
-                    if (ring[idx].Vk == 0) break;
-                    long age = start - ring[idx].Tick;
-                    if (age > 250) break;
-                    if (ring[idx].Vk == (ushort)vk && ring[idx].Down == down) return ring[idx].Remote;
-                }
+    /// Diagnostics for the last decision (hook thread only).
+    public static string LastProbe = "-";
+
+    /// Decide from device evidence whether a mapped key belongs to the remote.
+    /// Called from the hook, so it must never wait: WM_INPUT for the current
+    /// key arrives only after the hook chain returns (observed on Win11 RDP),
+    /// which is why in-hook polling of the current event can never succeed.
+    ///   remote spoke more recently (or only remote spoke)      -> remote
+    ///   a real keyboard spoke more recently, within the window -> physical
+    ///   no fresh evidence at all (first press after connect)   -> remote,
+    ///     because mapping is enabled and the BLE link is up - the mapped key
+    ///     is then almost certainly the remote's (physical keyboards speak
+    ///     constantly and would have fresher evidence).
+    public static bool LooksFromRemote() {
+        long now = NowMs();
+        lock (ringGate) {
+            bool remoteFresh = lastRemoteTick > 0 && now - lastRemoteTick < EVIDENCE_FRESH_MS;
+            bool foreignFresh = lastForeignTick > 0 && now - lastForeignTick < EVIDENCE_FRESH_MS;
+            if (remoteFresh && (!foreignFresh || lastRemoteTick >= lastForeignTick)) {
+                LastProbe = "遥控器最后按键 " + (now - lastRemoteTick) + "ms 前";
+                return true;
             }
-            if (attempt < 11) Thread.Sleep(1);
+            if (foreignFresh) {
+                LastProbe = "物理键盘最后按键 " + (now - lastForeignTick) + "ms 前";
+                return false;
+            }
+            LastProbe = "无近期按键证据 → 默认遥控器";
+            return true;
         }
-        return false;                                         // unattributed -> assume physical
     }
 
-    /// Test helper: pretend the given event just arrived from the remote.
-    internal static void SeedForTest(uint vk, bool down) {
+    /// Test helper: seed the evidence clocks (ages in ms, -1 = never seen).
+    internal static void SeedEvidence(long remoteAgeMs, long foreignAgeMs) {
+        long now = NowMs();
         lock (ringGate) {
-            ring[ringHead].Vk = (ushort)vk;
-            ring[ringHead].Down = down;
-            ring[ringHead].Tick = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
-            ring[ringHead].Remote = true;
-            ringHead = (ringHead + 1) % RING;
+            lastRemoteTick = remoteAgeMs >= 0 ? now - remoteAgeMs : 0;
+            lastForeignTick = foreignAgeMs >= 0 ? now - foreignAgeMs : 0;
         }
     }
 }
