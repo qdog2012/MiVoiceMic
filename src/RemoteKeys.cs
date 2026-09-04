@@ -18,6 +18,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -49,6 +50,7 @@ static class InputRouter {
     static volatile bool blockF5;         // swallow remote/physical F5 while linked
     static volatile bool linked;          // BLE link connected
     public static long SwallowedCount;
+    static int lastPassLogTick;           // hook thread only: throttle passthrough notes
 
     // ---- mapping state ----------------------------------------------------
     static readonly object mapGate = new object();
@@ -76,19 +78,25 @@ static class InputRouter {
                     bool f5Case = vk == VK_F5 && blockF5;        // legacy blocker semantics
                     bool mapCase = false;
                     if (mappingEnabled) lock (mapGate) mapCase = engine.HasBinding(vk);
-                    if (f5Case || mapCase) {
-                        bool remote = true;
-                        if (mapCase) remote = RawSink.IsFromRemote(vk, down, k.time);
-                        if (remote) {
-                            Interlocked.Increment(ref SwallowedCount);
-                            if (mapCase) mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = down, TickMs = NowMs() });
-                            return (IntPtr)1;                    // swallowed
-                        }
-                        if (f5Case) {                            // physical F5 while linked: still swallowed (old behavior)
-                            Interlocked.Increment(ref SwallowedCount);
-                            return (IntPtr)1;
-                        }
+                if (f5Case || mapCase) {
+                    bool remote = true;
+                    if (mapCase) remote = RawSink.IsFromRemote(vk, down, k.time);
+                    if (remote) {
+                        Interlocked.Increment(ref SwallowedCount);
+                        if (mapCase) mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = down, TickMs = NowMs() });
+                        return (IntPtr)1;                    // swallowed
                     }
+                    if (f5Case) {                            // physical F5 while linked: still swallowed (old behavior)
+                        Interlocked.Increment(ref SwallowedCount);
+                        return (IntPtr)1;
+                    }
+                    int t = Environment.TickCount;           // mapped key from another device: throttled note
+                    if (t - lastPassLogTick > 2000 || t < lastPassLogTick) {
+                        lastPassLogTick = t;
+                        Log.Info("[INPUT] 0x" + vk.ToString("X2") + (down ? " 按下" : " 松开") +
+                                 " 已映射但未归因遥控器 → 放行（物理键）");
+                    }
+                }
                 }
             }
         } catch { }
@@ -157,14 +165,16 @@ static class InputRouter {
     public static void SetMappingEnabled(bool on) { mappingEnabled = on; }
 
     /// Swap in a new mapping table (config edit / preset load). Safe at any time.
-    public static void SetKeyMap(KeyMapConfig map) {
+    public static void SetKeyMap(KeyMapConfig map) { SetKeyMap(map, null); }
+
+    public static void SetKeyMap(KeyMapConfig map, string macPrefix) {
         if (map == null) { mappingEnabled = false; return; }
         List<KeyMapEntry> bound = new List<KeyMapEntry>();
         foreach (KeyMapEntry e in map.keys) if (e != null && e.Mapped) bound.Add(e);
         lock (mapGate) {
             engine = new GestureEngine(bound.ToArray());
             mappingEnabled = map.enabled && bound.Count > 0;
-            RawSink.SetMatchers(map.matchVidPid);
+            RawSink.SetMatchers(map.matchVidPid, macPrefix);
         }
         Log.Info("[INPUT] keymap: " + bound.Count + " mapped key(s), " + (mappingEnabled ? "enabled" : "disabled"));
     }
@@ -403,6 +413,37 @@ static class RawSink {
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr hRawInput, uint uiCommand, IntPtr pData, ref uint pcbSize, uint cbSizeHeader);
     [DllImport("user32.dll")] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
     [DllImport("user32.dll")] static extern uint GetRawInputDeviceInfo(IntPtr hDevice, uint uiCommand, System.Text.StringBuilder pData, ref uint pcbSize);
+    [DllImport("user32.dll")] static extern uint GetRawInputDeviceList([Out] RAWINPUTDEVICELIST[] list, ref uint count, uint size);
+
+    struct RAWINPUTDEVICELIST { public IntPtr hDevice; public uint dwType; }
+
+    /// Startup visibility: list every raw-input keyboard and mark which one
+    /// attribution picks as the remote (goes to MiVoiceMic.log).
+    static void LogRawKeyboards() {
+        try {
+            uint count = 0, size = (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICELIST));
+            if (GetRawInputDeviceList(null, ref count, size) == unchecked((uint)-1) || count == 0) return;
+            var list = new RAWINPUTDEVICELIST[count];
+            if (GetRawInputDeviceList(list, ref count, size) == unchecked((uint)-1)) return;
+            int keyboards = 0; string matched = null;
+            lock (ringGate) {
+                foreach (var d in list) {
+                    if (d.dwType != 1) continue;                  // RIM_TYPEKEYBOARD
+                    keyboards++;
+                    var sb = new System.Text.StringBuilder(512);
+                    uint sz = (uint)sb.Capacity;
+                    uint r = GetRawInputDeviceInfo(d.hDevice, RIDI_DEVICENAME, sb, ref sz);
+                    if (r == unchecked((uint)-1) || r == 0) continue;
+                    string name = sb.ToString();
+                    bool remote = DeviceIsRemote(d.hDevice);
+                    Log.Info("[INPUT] raw 键盘: " + name + (remote ? "  <= 遥控器" : ""));
+                    if (remote) matched = name;
+                }
+            }
+            Log.Info("[INPUT] raw 键盘共 " + keyboards + " 台; 遥控器归因: " +
+                     (matched != null ? "已匹配" : "未发现（检查 keymap.matchVidPid / deviceMacPrefix）"));
+        } catch (Exception ex) { Log.Error("[INPUT] rawlist: " + ex.Message); }
+    }
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -426,7 +467,7 @@ static class RawSink {
     const uint WM_INPUT = 0x00FF;
     const uint RIDEV_INPUTSINK = 0x00000100;
     const uint RID_INPUT = 0x100000;
-    const uint RIDI_DEVICENAME = 0x20000003;
+    const uint RIDI_DEVICENAME = 0x20000007;   // NOT 0x20000003 - the wrong value made every query fail
 
     [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
     [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
@@ -436,7 +477,11 @@ static class RawSink {
     static Thread thread;
     static IntPtr hwnd = IntPtr.Zero;
     static readonly WndProc proc = SinkProc;
-    static volatile List<string> matchers = new List<string>();   // "vid_2717&pid_32b8"
+    // raw config (re-parsed on Start) + derived substrings matched against the
+    // lowercase raw-input device path
+    static List<string> vidPid = new List<string> { "2717:32B8" };
+    static string macPrefix = "";
+    static List<string> matchers = BuildMatchers(vidPid, macPrefix);
 
     // correlation ring
     struct Rec { public ushort Vk; public bool Down; public long Tick; public bool Remote; }
@@ -446,22 +491,54 @@ static class RawSink {
     static readonly object ringGate = new object();
     static readonly Dictionary<IntPtr, bool> deviceCache = new Dictionary<IntPtr, bool>();
 
-    public static void SetMatchers(List<string> vidPidList) {
+    /// <param name="vidPidList">Config entries like "2717:32B8" (hex, "0x" ok).</param>
+    /// <param name="macPrefix">Optional BLE MAC prefix like "C0:5D:39" - the raw
+    /// input path of a HID-over-GATT device embeds its MAC, so this is a
+    /// model-independent extra matcher.</param>
+    public static void SetMatchers(List<string> vidPidList, string mac) {
+        if (vidPidList != null && vidPidList.Count > 0) vidPid = vidPidList;
+        macPrefix = mac ?? "";
+        List<string> m = BuildMatchers(vidPid, macPrefix);
+        lock (ringGate) { matchers = m; deviceCache.Clear(); }
+    }
+
+    /// USB keyboards enumerate as HID\VID_2717&amp;PID_32B8\... but HID-over-GATT
+    /// (BLE) keyboards as HID\{1812guid}_DEV_VID&amp;012717_PID&amp;32b8_REV&amp;00a4_&lt;mac&gt; -
+    /// VID is stored as (vendorIdSource&lt;&lt;16)|vid, source 01=Bluetooth SIG /
+    /// 02=USB-IF, so both spellings must be matched (the USB-style substring
+    /// alone never matches a BLE remote - that silently disabled keymap
+    /// attribution on the real device).
+    static List<string> BuildMatchers(List<string> vidPidList, string macPrefix) {
         var m = new List<string>();
         if (vidPidList != null)
             foreach (string s in vidPidList) {
                 if (string.IsNullOrWhiteSpace(s)) continue;
                 string[] parts = s.Split(':');
-                if (parts.Length == 2 && parts[0].Trim().Length > 0 && parts[1].Trim().Length > 0)
-                    m.Add("vid_" + parts[0].Trim().ToLowerInvariant() + "&pid_" + parts[1].Trim().ToLowerInvariant());
+                uint vid, pid;
+                if (parts.Length == 2 && TryHex(parts[0].Trim(), out vid) && TryHex(parts[1].Trim(), out pid)) {
+                    string v = vid.ToString("x4"), p = pid.ToString("x4");
+                    m.Add("vid_" + v + "&pid_" + p);          // USB HID
+                    m.Add("vid&0" + v + "_pid&" + p);         // BLE HOGP, SIG vendor source
+                    m.Add("vid&2" + v + "_pid&" + p);         // BLE HOGP, USB vendor source
+                }
             }
-        if (m.Count == 0) m.Add("vid_2717&pid_32b8");
-        matchers = m;
-        lock (ringGate) deviceCache.Clear();
+        if (!string.IsNullOrWhiteSpace(macPrefix)) {
+            var hex = new System.Text.StringBuilder();
+            foreach (char c in macPrefix)
+                if (Uri.IsHexDigit(c)) hex.Append(char.ToLowerInvariant(c));
+            if (hex.Length >= 6) m.Add(hex.ToString(0, 6));   // "C0:5D:39" -> "c05d39"
+        }
+        if (m.Count == 0) return BuildMatchers(new List<string> { "2717:32B8" }, "");
+        return m;
+    }
+
+    static bool TryHex(string s, out uint v) {
+        if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2);
+        return uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v);
     }
 
     public static void Start() {
-        SetMatchers(matchers);                               // normalize defaults
+        lock (ringGate) matchers = BuildMatchers(vidPid, macPrefix);   // re-derive (config may have landed before Start)
         if (thread != null) return;
         thread = new Thread((ThreadStart)delegate {
             var wc = new WNDCLASS();
@@ -477,6 +554,7 @@ static class RawSink {
             rid[0].hwndTarget = hwnd;
             if (!RegisterRawInputDevices(rid, 1, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE))))
                 Log.Error("[INPUT] RegisterRawInputDevices failed: " + Marshal.GetLastWin32Error());
+            LogRawKeyboards();
             MSG m;
             while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { TranslateMessage(ref m); DispatchMessage(ref m); }
         }) { IsBackground = true, Name = "rawsink" };
@@ -522,15 +600,15 @@ static class RawSink {
             if (deviceCache.TryGetValue(hDevice, out cached)) return cached;
             bool remote = false;
             try {
-                uint sz = 0;
-                GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, null, ref sz);
-                if (sz > 0 && sz < 1024) {
-                    var sb = new System.Text.StringBuilder((int)sz);
-                    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, sb, ref sz) > 0) {
-                        string path = sb.ToString().ToLowerInvariant();
-                        foreach (string m in matchers)
-                            if (path.IndexOf(m) >= 0) { remote = true; break; }
-                    }
+                // no NULL size-probe here: RIDI_DEVICENAME with pData=NULL fails
+                // outright - a big-enough buffer must be passed in one call
+                var sb = new System.Text.StringBuilder(512);
+                uint sz = (uint)sb.Capacity;
+                uint r = GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, sb, ref sz);
+                if (r != unchecked((uint)-1) && r > 0) {
+                    string path = sb.ToString().ToLowerInvariant();
+                    foreach (string m in matchers)
+                        if (path.IndexOf(m) >= 0) { remote = true; break; }
                 }
             } catch { }
             deviceCache[hDevice] = remote;

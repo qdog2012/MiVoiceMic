@@ -20,7 +20,7 @@ class KeyMapAction {
 
     public KeyMapAction Clone() {
         var a = new KeyMapAction();
-        a.kind = kind; a.tap = tap; a.keys = keys; a.command = command; a.ms = ms;
+        a.kind = kind; a.tap = tap; a.single = single; a.keys = keys; a.command = command; a.ms = ms;
         return a;
     }
 

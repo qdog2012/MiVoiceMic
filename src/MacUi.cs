@@ -33,12 +33,18 @@ static class MacTheme {
     public static float Scale { get { return scale; } }
 
     public static void Init() {
-        try {
-            using (var g = Graphics.FromHwnd(IntPtr.Zero)) {
-                scale = g.DpiX / 96f;
-                if (scale < 1f) scale = 1f;
-            }
-        } catch { scale = 1f; }
+        int dpi = 96;
+        try { using (var g = Graphics.FromHwnd(IntPtr.Zero)) dpi = (int)g.DpiX; } catch { }
+        Init(dpi);
+    }
+
+    // Scale from a real window's DeviceDpi, never the desktop DC alone: in a
+    // PerMonitorV2 process the desktop DC can report 96 on a 150% screen, so
+    // every S() layout shrinks while GDI still draws fonts at screen DPI -
+    // widgets end up outside their cards and unclickable.
+    public static void Init(int dpi) {
+        scale = dpi / 96f;
+        if (scale < 1f) scale = 1f;
     }
 
     public static int S(int px) { return (int)Math.Round(px * scale); }

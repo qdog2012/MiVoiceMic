@@ -20,6 +20,10 @@ abstract class MacPage : UserControl {
     public virtual void OnActivated() { }
     /// Remote key action fired (for canvas flash); worker thread origin.
     public virtual void OnActionFired(string keyId, string desc) { }
+
+    /// Force the page's OnResize layout even when its bounds did not change
+    /// (needed after a DPI-scale correction).
+    public void Relayout() { OnResize(EventArgs.Empty); }
 }
 
 sealed class MainWindow : Form {
