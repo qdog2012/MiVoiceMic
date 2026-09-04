@@ -12,7 +12,7 @@ if not exist "%CSC%" (
   exit /b 1
 )
 
-"%CSC%" /nologo /target:exe /platform:x64 /codepage:65001 /win32icon:app.ico ^
+"%CSC%" /nologo /target:winexe /platform:x64 /codepage:65001 /win32icon:app.ico ^
   /r:"%WINMD%\Windows.Devices.winmd" ^
   /r:"%WINMD%\Windows.Foundation.winmd" ^
   /r:"%WINMD%\Windows.Storage.winmd" ^

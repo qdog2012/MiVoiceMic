@@ -65,7 +65,7 @@ sealed class App : BleVoiceLink.IHandler {
 
         // 4. input router (F5 blocker + key mapping) + workers
         InputRouter.SetBlockF5(cfg.blockF5);
-        InputRouter.SetKeyMap(cfg.keymap);
+        InputRouter.SetKeyMap(cfg.keymap, cfg.deviceMacPrefix);
         InputRouter.Start();
         keyWorker = new Thread(KeyWorkerLoop) { IsBackground = true, Name = "keyworker" };
         keyWorker.Start();
@@ -112,7 +112,7 @@ sealed class App : BleVoiceLink.IHandler {
     public void ApplyConfig(Config updated) {
         injector = new HotkeyInjector(updated.hotkey.keys, updated.hotkey.mode);
         InputRouter.SetBlockF5(updated.blockF5);
-        InputRouter.SetKeyMap(updated.keymap);
+        InputRouter.SetKeyMap(updated.keymap, updated.deviceMacPrefix);
         Log.Info("[CFG] 热键: " + injector.Describe() + " | 拦截F5: " + (updated.blockF5 ? "开" : "关") +
                  " | 按键映射: " + (updated.keymap.enabled ? "开" : "关"));
     }
@@ -200,10 +200,12 @@ sealed class App : BleVoiceLink.IHandler {
         byte[] stale;
         while (audioQueue.TryTake(out stale)) { }         // drain stale audio
         if (cfg.dumpAudio) dumpBuffer = new List<short>(16000 * 2);
-        UiState.SetTalking(true);
         // 0x03 = HTT (voice key physically held); other reasons are firmware-initiated
         // sessions (e.g. right after MIC_OPEN) and must NOT hold the IME hotkey.
         hotkeyHeld = interaction == 0x03;
+        // firmware-initiated sessions carry no user audio and no matching AUDIO_STOP,
+        // so only a real key press may light up the talking UI (else it sticks on)
+        UiState.SetTalking(hotkeyHeld);
         Log.Voice(">>> 语音会话开始 (session " + sessionId + ", interaction " + interaction +
                   (hotkeyHeld ? ", 语音键按下" : ", 固件自启(不注入热键)") + ")");
         if (hotkeyHeld)
@@ -216,9 +218,11 @@ sealed class App : BleVoiceLink.IHandler {
         double secs = (DateTime.Now - talkStart).TotalSeconds;
         Log.Voice("<<< 松开语音键 (" + framesDecoded + " 帧, " + secs.ToString("0.0") + "s)");
         UiState.SetTalking(false);
-        lock (cfg) {
-            cfg.stats.AddSession(secs);
-            cfg.Save();                      // persist usage counters after each session
+        if (framesDecoded > 0) {             // sessions with no decoded audio (firmware self-start) don't count
+            lock (cfg) {
+                cfg.stats.AddSession(secs);
+                cfg.Save();                  // persist usage counters after each session
+            }
         }
         if (dumpBuffer != null && dumpBuffer.Count > 0) {
             string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,

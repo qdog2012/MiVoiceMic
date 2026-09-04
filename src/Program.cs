@@ -11,17 +11,22 @@ using System.Threading.Tasks;
 
 static class Program {
     [DllImport("kernel32.dll")] static extern bool SetConsoleOutputCP(uint cp);
+    [DllImport("kernel32.dll")] static extern bool AttachConsole(uint pid);
+    [DllImport("kernel32.dll")] static extern bool AllocConsole();
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] static extern IntPtr SetProcessDpiAwarenessContext(IntPtr value);
 
+    const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFF;
+
     [STAThread]
     static int Main(string[] args) {
+        string mode = args != null && args.Length > 0 ? args[0].ToLowerInvariant() : "";
+        // winexe build has no console; tool modes re-attach to the calling
+        // terminal (or allocate one) so --check/--sniff/--e2e output is visible
+        if (mode.Length > 0 && !AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
         try { SetConsoleOutputCP(65001); } catch { }
         try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
-        Console.Title = "MiVoiceMic";
-
-        string mode = args != null && args.Length > 0 ? args[0].ToLowerInvariant() : "";
         if (mode == "--selftest") return SelfTest.Run();
         if (mode == "--check") return Diag.Run();
         if (mode == "--sniff") return Sniffer.Run(args.Length > 1 ? int.Parse(args[1]) : 20);

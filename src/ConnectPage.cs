@@ -147,6 +147,12 @@ class ConnectPage : MacPage {
         Controls.Add(f5Toggle); Controls.Add(autoPairToggle); Controls.Add(autoStartToggle);
         Controls.Add(reconnectBtn);
 
+        // cards were added before the widgets, so they sit ABOVE them in the
+        // z-order and hide/block every toggle, slider and button - push the
+        // cards (pure painting panels) behind the interactive controls.
+        deviceCard.SendToBack(); hotkeyCard.SendToBack();
+        audioCard.SendToBack(); remoteCard.SendToBack();
+
         deviceCard.PaintContent += PaintDeviceContent;
         hotkeyCard.PaintContent += PaintHotkeyContent;
         audioCard.PaintContent += PaintAudioContent;
@@ -274,7 +280,8 @@ class ConnectPage : MacPage {
         autoPairToggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(66) - MacTheme.S(2));
         autoStartToggle.Location = new Point(rightX + rightW - MacTheme.S(58), remoteCard.Top + MacTheme.S(98) - MacTheme.S(2));
 
-        reconnectBtn.Location = new Point(deviceCard.Left + MacTheme.S(18), deviceCard.Bottom - MacTheme.S(112));
+        reconnectBtn.Location = new Point(deviceCard.Left + (deviceCard.Width - reconnectBtn.Width) / 2,
+            deviceCard.Bottom - MacTheme.S(52));
         Invalidate();
     }
 
@@ -292,7 +299,7 @@ class ConnectPage : MacPage {
     void PaintDeviceContent(Graphics g) {
         var s = UiState.Take();
         int w = deviceCard.Width, hgt = deviceCard.Height;
-        var art = new RectangleF(MacTheme.S(16), MacTheme.S(20), w - MacTheme.S(32), hgt - MacTheme.S(186));
+        var art = new RectangleF(MacTheme.S(16), MacTheme.S(20), w - MacTheme.S(32), hgt - MacTheme.S(244));
         RemotePainter.Draw(g, art, s.Talking, null);
 
         float infoY = art.Bottom + MacTheme.S(4);
@@ -329,13 +336,20 @@ class ConnectPage : MacPage {
                     using (var b = new SolidBrush(bc)) g.FillPath(b, path);
                 }
             }
-            infoY += MacTheme.S(42);
         }
+
+        // bottom block is anchored to the card bottom: stats, then the talking
+        // indicator (reserved slot), then the reconnect button (see OnResize)
+        string stats = App.Config.stats != null && App.Config.stats.daySessions > 0
+            ? "今日语音 " + App.Config.stats.daySessions + " 次 · " + FormatSeconds(App.Config.stats.daySeconds)
+            : "今日还没有语音输入";
+        Gfx.Text(g, stats, smallFont, MacTheme.TextTertiary,
+            new RectangleF(MacTheme.S(16), hgt - MacTheme.S(118), w - MacTheme.S(32), MacTheme.S(16)), StringAlignment.Center);
 
         if (s.Talking) {
             Gfx.Text(g, "正在说话…", bodyFont, MacTheme.Accent,
-                new RectangleF(MacTheme.S(16), infoY, w - MacTheme.S(32), MacTheme.S(18)), StringAlignment.Center);
-            var bar = new RectangleF(MacTheme.S(40), infoY + MacTheme.S(21), w - MacTheme.S(80), MacTheme.S(6));
+                new RectangleF(MacTheme.S(16), hgt - MacTheme.S(96), w - MacTheme.S(32), MacTheme.S(18)), StringAlignment.Center);
+            var bar = new RectangleF(MacTheme.S(40), hgt - MacTheme.S(75), w - MacTheme.S(80), MacTheme.S(6));
             using (var path = Gfx.RoundRect(new Rectangle((int)bar.X, (int)bar.Y, (int)bar.Width, (int)bar.Height), MacTheme.S(3))) {
                 using (var b = new SolidBrush(MacTheme.TrackOff)) g.FillPath(b, path);
             }
@@ -348,12 +362,6 @@ class ConnectPage : MacPage {
                 }
             }
         }
-
-        string stats = App.Config.stats != null && App.Config.stats.daySessions > 0
-            ? "今日语音 " + App.Config.stats.daySessions + " 次 · " + FormatSeconds(App.Config.stats.daySeconds)
-            : "今日还没有语音输入";
-        Gfx.Text(g, stats, smallFont, MacTheme.TextTertiary,
-            new RectangleF(MacTheme.S(16), hgt - MacTheme.S(40), w - MacTheme.S(32), MacTheme.S(16)), StringAlignment.Center);
     }
 
     void PaintHotkeyContent(Graphics g) {
