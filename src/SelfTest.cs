@@ -26,6 +26,7 @@ static class SelfTest {
         TestKeyMap();
         TestChargeState();
         TestLooksFromRemote();
+        TestDeferredAttribution();
         Console.WriteLine("== " + passed + " passed, " + failed + " failed ==");
         return failed == 0 ? 0 : 1;
     }
@@ -263,9 +264,10 @@ static class SelfTest {
     }
 
     static void TestLooksFromRemote() {
-        // mapped-key device decision: latest speaker wins, no evidence -> remote
+        // mapped-key device decision: latest speaker wins; no evidence -> the
+        // DOWN is deferred (swallowed) and the UP's own WM_INPUT will decide
         RawSink.SeedEvidence(-1, -1);
-        Check(RawSink.LooksFromRemote(), "无证据（连接后第一按）-> 遥控器");
+        Check(!RawSink.LooksFromRemote(), "无证据（安静期）-> 延迟归因");
         RawSink.SeedEvidence(300, -1);
         Check(RawSink.LooksFromRemote(), "遥控器 300ms 前按过 -> 遥控器");
         RawSink.SeedEvidence(-1, 300);
@@ -275,13 +277,60 @@ static class SelfTest {
         RawSink.SeedEvidence(100, 500);
         Check(RawSink.LooksFromRemote(), "遥控器(100ms)比物理键盘(500ms)新 -> 遥控器");
         RawSink.SeedEvidence(5000, 5000);
-        Check(RawSink.LooksFromRemote(), "双方证据都过期 -> 遥控器（映射已启用）");
+        Check(!RawSink.LooksFromRemote(), "双方证据都过期 -> 延迟归因");
         RawSink.SeedEvidence(-1, 5000);
-        Check(RawSink.LooksFromRemote(), "物理键盘证据过期 -> 遥控器");
+        Check(!RawSink.LooksFromRemote(), "物理键盘证据过期、无遥控器证据 -> 延迟归因");
+        RawSink.SeedEvidence(5000, -1);
+        Check(!RawSink.LooksFromRemote(), "遥控器证据过期、无物理键盘证据 -> 延迟归因（首按不透传）");
         RawSink.SeedEvidence(2100, 2500);
-        Check(RawSink.LooksFromRemote(), "双方证据都过期(2100/2500ms) -> 遥控器（默认）");
+        Check(!RawSink.LooksFromRemote(), "双方证据都过期(2100/2500ms) -> 延迟归因");
         RawSink.SeedEvidence(2100, 100);
         Check(!RawSink.LooksFromRemote(), "遥控器证据过期但物理键盘新鲜 -> 物理键");
+        // latch: a swallowed remote key refreshes its own clock (swallowed keys
+        // produce no WM_INPUT), keeping a burst remapped without gaps
+        RawSink.SeedEvidence(-1, -1);
+        RawSink.NoteRemoteActivity();
+        Check(RawSink.LooksFromRemote(), "吞键闩锁续期 -> 遥控器");
+        RawSink.SeedEvidence(5000, 5000);
+        RawSink.NoteRemoteActivity();
+        Check(RawSink.LooksFromRemote(), "证据过期后吞键闩锁 -> 遥控器（连发不断链）");
+        RawSink.NoteRemoteActivity();
+        RawSink.SeedEvidence(150, 100); // 闩锁发生在150ms前、之后物理键盘100ms前按过
+        Check(!RawSink.LooksFromRemote(), "闩锁后物理键盘更新 -> 物理键（打字随时夺回）");
         RawSink.SeedEvidence(-1, -1);   // leave the clean default for other tests
+    }
+
+    static void TestDeferredAttribution() {
+        // ring lookup: the passed orphan UP's own WM_INPUT is per-event truth
+        long now = RawSink.TicksNow();
+        RawSink.SeedRing(0x25, false, true, 100);
+        Check(RawSink.FindRecent(0x25, false, now - 300, now + 1000) == 1, "ring: 命中遥控器 up");
+        Check(RawSink.FindRecent(0x26, false, now - 300, now + 1000) == -1, "ring: vk 不符未命中");
+        Check(RawSink.FindRecent(0x25, true, now - 300, now + 1000) == -1, "ring: down/up 类型不符未命中");
+        RawSink.SeedRing(0x25, false, false, 50);
+        Check(RawSink.FindRecent(0x25, false, now - 300, now + 1000) == 0, "ring: 更新的物理键盘 up 优先");
+
+        // hook deferred path: ambiguous mapped DOWN is swallowed (no ghost) and
+        // its UP passes so the sink can attribute it; confident remote presses
+        // still swallow down+up and feed the gesture engine
+        InputRouter.SetBlockF5(false);
+        InputRouter.SetLinked(true);
+        RawSink.SeedEvidence(-1, -1);
+        var map = new KeyMapConfig();
+        map.enabled = true;
+        map.Find("left").click.kind = "combo";
+        map.Find("left").click.keys = "BACK";
+        InputRouter.SetKeyMap(map, null);
+        IntPtr defDown = InputRouter.TestDispatch(0x25, true);
+        IntPtr defUp = InputRouter.TestDispatch(0x25, false);
+        Check(defDown == (IntPtr)1, "延迟归因：无证据 DOWN 吞下（不透传防 ghost）");
+        Check(defUp != (IntPtr)1, "延迟归因：UP 放行（孤儿抬起，供 WM_INPUT 归因）");
+        RawSink.SeedEvidence(100, -1);
+        IntPtr remDown = InputRouter.TestDispatch(0x25, true);
+        IntPtr remUp = InputRouter.TestDispatch(0x25, false);
+        Check(remDown == (IntPtr)1 && remUp == (IntPtr)1, "证据明确遥控器：down/up 都吞下并映射");
+        InputRouter.SetKeyMap(null);
+        RawSink.SeedEvidence(-1, -1);
+        InputRouter.SetBlockF5(true);
     }
 }

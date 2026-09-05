@@ -4,11 +4,15 @@
 //
 // Attribution: the low-level hook cannot see which device a key came from, but
 // Raw Input can. A hidden sink window (own thread, RIDEV_INPUTSINK) records
-// {vk, down, tick, fromRemote} for every keyboard event; the hook callback
-// correlates the event in front of it against that record (short bounded wait)
-// and only remotes keys that Raw Input attributes to the remote's HID device
-// (matched by VID:PID, default 2717:32B8). Failure to attribute always falls
-// back to "physical keyboard" -> pass through.
+// device-evidence clocks (remote vs physical, see RawSink). Swallowed keys
+// produce no WM_INPUT of their own, so per-event correlation of a swallowed
+// key is impossible - the hook decides from which device spoke more recently
+// (a swallowed remote key latches the clock via NoteRemoteActivity, a physical
+// keystroke always passes and refreshes its clock). With NO fresh evidence the
+// DOWN is swallowed and deferred attribution kicks in: the UP is passed as a
+// harmless orphan keyup, its own WM_INPUT names the device, and the worker
+// either fires the mapped action (remote) or replays the original key
+// (physical). No ghost keys, no misattributed physical presses.
 //
 // Gestures: click / long-press per key, actions = combo (tap or hold-through),
 // task view, launch app, shell command. Executed on a dedicated worker thread,
@@ -68,6 +72,20 @@ static class InputRouter {
         if (h != null) { try { h(id, desc); } catch { } }
     }
 
+    // ---- deferred attribution ----------------------------------------------
+    // A mapped key with no fresh device evidence must NOT be passed through
+    // (a remote first press would ghost into the app) and cannot be attributed
+    // as a swallowed key (swallowed keys generate no WM_INPUT). So: swallow the
+    // DOWN silently, and when the UP arrives pass it through - an orphan keyup
+    // is harmless, and only a passed event gets a WM_INPUT whose hDevice names
+    // the true device. The map worker then either fires the mapped action
+    // (remote) or replays the original key via SendInput (physical). Per-event
+    // truth, no guessing, at the cost of that one press acting on release.
+    sealed class PendingUp { public ushort Vk; public long HookTick; public int Verdict; }
+    static readonly Dictionary<uint, long> pendingDowns = new Dictionary<uint, long>();   // hook thread only
+    static readonly List<PendingUp> pendingUps = new List<PendingUp>();                   // hook writes, worker drains
+    static readonly object pendingGate = new object();
+
     static IntPtr HookCb(int nCode, IntPtr wParam, IntPtr lParam) {
         try {
             if (nCode >= 0 && linked) {
@@ -78,30 +96,87 @@ static class InputRouter {
                     bool f5Case = vk == VK_F5 && blockF5;        // legacy blocker semantics
                     bool mapCase = false;
                     if (mappingEnabled) lock (mapGate) mapCase = engine.HasBinding(vk);
-                if (f5Case || mapCase) {
-                    bool remote = true;
-                    if (mapCase) remote = RawSink.LooksFromRemote();
-                    if (remote) {
-                        Interlocked.Increment(ref SwallowedCount);
-                        if (mapCase) mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = down, TickMs = NowMs() });
-                        return (IntPtr)1;                    // swallowed
+                    if (mapCase && !down && pendingDowns.Count > 0) {
+                        bool wasPending = false;
+                        lock (pendingGate) wasPending = pendingDowns.Remove(vk);
+                        if (wasPending) {
+                            lock (pendingGate) pendingUps.Add(new PendingUp { Vk = (ushort)vk, HookTick = NowMs() });
+                            return CallNextHookEx(hhk, nCode, wParam, lParam);   // orphan UP: pass, its WM_INPUT decides
+                        }
                     }
-                    if (f5Case) {                            // physical F5 while linked: still swallowed (old behavior)
-                        Interlocked.Increment(ref SwallowedCount);
-                        return (IntPtr)1;
+                    if (f5Case || mapCase) {
+                        bool remote = true;
+                        if (mapCase) remote = RawSink.LooksFromRemote();
+                        if (remote) {
+                            Interlocked.Increment(ref SwallowedCount);
+                            if (mapCase) {
+                                RawSink.NoteRemoteActivity();    // swallowed keys produce no WM_INPUT - latch the burst
+                                mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = down, TickMs = NowMs() });
+                            }
+                            return (IntPtr)1;                    // swallowed
+                        }
+                        if (mapCase && down) {
+                            // ambiguous DOWN: swallow silently and wait for the UP
+                            lock (pendingGate) pendingDowns[vk] = NowMs();
+                            int td = Environment.TickCount;
+                            if (td - lastPassLogTick > 2000 || td < lastPassLogTick) {
+                                lastPassLogTick = td;
+                                Log.Info("[INPUT] 0x" + vk.ToString("X2") + " 按下 无近期证据 → 延迟归因（松开时判定） 证据=" + RawSink.LastProbe);
+                            }
+                            return (IntPtr)1;
+                        }
+                        if (f5Case) {                            // physical F5 while linked: still swallowed (old behavior)
+                            Interlocked.Increment(ref SwallowedCount);
+                            return (IntPtr)1;
+                        }
+                        if (mapCase && !down) {                  // evidence flipped mid-press: still let the engine finish its state
+                            mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = false, TickMs = NowMs() });
+                        }
+                        int t = Environment.TickCount;           // rare stray event: throttled note
+                        if (t - lastPassLogTick > 2000 || t < lastPassLogTick) {
+                            lastPassLogTick = t;
+                            Log.Info("[INPUT] 0x" + vk.ToString("X2") + (down ? " 按下" : " 松开") +
+                                     " 已映射但最近物理键盘更活跃 → 放行" +
+                                     (mapCase ? " 证据=" + RawSink.LastProbe : ""));
+                        }
                     }
-                    int t = Environment.TickCount;           // mapped key from another device: throttled note
-                    if (t - lastPassLogTick > 2000 || t < lastPassLogTick) {
-                        lastPassLogTick = t;
-                        Log.Info("[INPUT] 0x" + vk.ToString("X2") + (down ? " 按下" : " 松开") +
-                                 " 已映射但最近物理键盘更活跃 → 放行" +
-                                 (mapCase ? " 证据=" + RawSink.LastProbe : ""));
-                    }
-                }
                 }
             }
         } catch { }
         return CallNextHookEx(hhk, nCode, wParam, lParam);
+    }
+
+    /// Map-worker side: correlate each passed UP against the raw-input ring and
+    /// act on the per-event verdict. verdict 1 = remote (synthesize the press
+    /// the hook swallowed), 0 = physical (replay the original key), -1 = no
+    /// raw input seen within 500ms (sink blind) -> replay, consistent with the
+    /// global pass-through default.
+    static void ResolvePendingUps() {
+        List<PendingUp> done = null;
+        long now = NowMs();
+        lock (pendingGate) {
+            for (int i = pendingUps.Count - 1; i >= 0; i--) {
+                PendingUp p = pendingUps[i];
+                int v = RawSink.FindRecent(p.Vk, false, p.HookTick - 30, now);
+                if (v < 0 && now - p.HookTick < 500) continue;   // its WM_INPUT has not landed yet
+                p.Verdict = v < 0 ? 0 : v;
+                pendingUps.RemoveAt(i);
+                if (done == null) done = new List<PendingUp>();
+                done.Add(p);
+            }
+        }
+        if (done == null) return;
+        for (int i = 0; i < done.Count; i++) {
+            PendingUp p = done[i];
+            if (p.Verdict == 1) {
+                long tick = NowMs();
+                mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = p.Vk, Down = true, TickMs = tick });
+                mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = p.Vk, Down = false, TickMs = tick + 1 });
+            } else {
+                KeySender.Tap(new ushort[] { p.Vk });            // injected -> hook ignores, hDevice=0 votes for neither side
+            }
+            Log.Info("[INPUT] 延迟归因 0x" + p.Vk.ToString("X2") + " -> " + (p.Verdict == 1 ? "遥控器（补发映射动作）" : "物理键盘（还原原键）"));
+        }
     }
 
     static long NowMs() { return DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond; }
@@ -149,6 +224,7 @@ static class InputRouter {
                         lock (mapGate) engine.Tick(NowMs(), pending);
                         Flush(pending);
                     } catch (Exception ex) { Log.Error("[INPUT] tick: " + ex.Message); }
+                    try { ResolvePendingUps(); } catch (Exception ex) { Log.Error("[INPUT] pending: " + ex.Message); }
                 }
             }) { IsBackground = true, Name = "keymap" };
             mapWorker.Start();
@@ -665,28 +741,40 @@ static class RawSink {
     /// Called from the hook, so it must never wait: WM_INPUT for the current
     /// key arrives only after the hook chain returns (observed on Win11 RDP),
     /// which is why in-hook polling of the current event can never succeed.
-    ///   remote spoke more recently (or only remote spoke)      -> remote
-    ///   a real keyboard spoke more recently, within the window -> physical
-    ///   no fresh evidence at all (first press after connect)   -> remote,
-    ///     because mapping is enabled and the BLE link is up - the mapped key
-    ///     is then almost certainly the remote's (physical keyboards speak
-    ///     constantly and would have fresher evidence).
+    ///   physical keyboard spoke more recently                  -> physical
+    ///   remote spoke more recently (latched, see NoteRemoteActivity) -> remote
+    ///   no fresh evidence at all                               -> NOT remote
+    ///     = deferred attribution (PendingUp): the DOWN is swallowed so a
+    ///     remote first press can never ghost, and the UP's own WM_INPUT names
+    ///     the true device. The old default ("mapping is on and the link is
+    ///     up, so it's almost certainly the remote") remapped every isolated
+    ///     physical arrow press during quiet periods and could never
+    ///     self-correct; the pass-through alternative ghosted the remote.
     public static bool LooksFromRemote() {
         long now = NowMs();
         lock (ringGate) {
             bool remoteFresh = lastRemoteTick > 0 && now - lastRemoteTick < EVIDENCE_FRESH_MS;
             bool foreignFresh = lastForeignTick > 0 && now - lastForeignTick < EVIDENCE_FRESH_MS;
-            if (remoteFresh && (!foreignFresh || lastRemoteTick >= lastForeignTick)) {
-                LastProbe = "遥控器最后按键 " + (now - lastRemoteTick) + "ms 前";
-                return true;
-            }
-            if (foreignFresh) {
+            if (foreignFresh && (!remoteFresh || lastForeignTick > lastRemoteTick)) {
                 LastProbe = "物理键盘最后按键 " + (now - lastForeignTick) + "ms 前";
                 return false;
             }
-            LastProbe = "无近期按键证据 → 默认遥控器";
-            return true;
+            if (remoteFresh) {
+                LastProbe = "遥控器最后按键 " + (now - lastRemoteTick) + "ms 前";
+                return true;
+            }
+            LastProbe = "无近期按键证据 → 延迟归因";
+            return false;
         }
+    }
+
+    /// The hook just swallowed a mapped key on a "remote" verdict. Swallowed
+    /// keys never reach the raw-input sink, so without this latch the remote's
+    /// evidence clock would starve mid-burst and the very next press would
+    /// fall back to pass-through. A real keystroke from the physical keyboard
+    /// (it always passes) still overrides: fresh foreign evidence wins.
+    public static void NoteRemoteActivity() {
+        lock (ringGate) { lastRemoteTick = NowMs(); }
     }
 
     /// Test helper: seed the evidence clocks (ages in ms, -1 = never seen).
@@ -695,6 +783,39 @@ static class RawSink {
         lock (ringGate) {
             lastRemoteTick = remoteAgeMs >= 0 ? now - remoteAgeMs : 0;
             lastForeignTick = foreignAgeMs >= 0 ? now - foreignAgeMs : 0;
+        }
+    }
+
+    internal static long TicksNow() { return NowMs(); }
+
+    /// Test helper: push one event into the correlation ring (age in ms).
+    internal static void SeedRing(ushort vk, bool down, bool remote, long ageMs) {
+        long tick = NowMs() - ageMs;
+        lock (ringGate) {
+            ring[ringHead].Vk = vk;
+            ring[ringHead].Down = down;
+            ring[ringHead].Tick = tick;
+            ring[ringHead].Remote = remote;
+            ringHead = (ringHead + 1) % RING;
+        }
+    }
+
+    /// Newest ring event matching {vk, down} with Tick in [minTick, maxTick].
+    /// Returns 1 remote / 0 physical / -1 not found. Used by the deferred
+    /// attribution path: the passed orphan UP's own WM_INPUT is per-event truth
+    /// about which device the press came from.
+    public static int FindRecent(ushort vk, bool down, long minTick, long maxTick) {
+        lock (ringGate) {
+            int best = -1;
+            long bestTick = long.MinValue;
+            for (int i = 0; i < RING; i++) {
+                Rec r = ring[i];
+                if (r.Vk == vk && r.Down == down && r.Tick >= minTick && r.Tick <= maxTick && r.Tick > bestTick) {
+                    bestTick = r.Tick;
+                    best = r.Remote ? 1 : 0;
+                }
+            }
+            return best;
         }
     }
 }
