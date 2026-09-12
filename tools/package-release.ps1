@@ -5,6 +5,10 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Use a stable version such as v1.0.1.' }
 $repoRoot = Split-Path $PSScriptRoot -Parent
+$exeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $repoRoot 'MiVoiceMic.exe')).FileVersion
+if ($exeVersion -ne ($Version.Substring(1) + '.0')) {
+    throw "Executable version $exeVersion does not match $Version. Update src/AppVersion.cs and rebuild first."
+}
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repoRoot "artifacts\release\$Version" }
 if (Test-Path -LiteralPath $OutputDirectory) {
     if (Get-ChildItem -LiteralPath $OutputDirectory -Force) { throw 'The release output directory must be empty.' }

@@ -7,6 +7,8 @@ MiVoiceMic.new.exe
 MiVoiceMic.log
 dump_*.wav
 config.json
+.MiVoiceMic-update-*/
+*.update-lock
 
 # scratch screenshots (docs/screenshots is the curated set)
 shots/

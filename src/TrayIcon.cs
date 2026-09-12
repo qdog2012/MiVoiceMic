@@ -64,12 +64,7 @@ static class TrayIcon {
         menu.Items.Add(new ToolStripMenuItem("重新连接遥控器", null, delegate { Safe(delegate { app.Reconnect(); }); }));
         menu.Items.Add(new ToolStripMenuItem("编辑配置 (config.json)", null, delegate { OpenConfig(); }));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem("退出", null, delegate {
-            Safe(delegate { app.Shutdown(); });
-            if (icon != null) icon.Visible = false;
-            Application.ExitThread();
-            Environment.Exit(0);
-        }));
+        menu.Items.Add(new ToolStripMenuItem("退出", null, delegate { ExitApplication(); }));
 
         System.Drawing.Icon trayIcon = null;
         try { trayIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -86,6 +81,15 @@ static class TrayIcon {
         timer.Start();
         ApplyConfigChecks();
         return icon;
+    }
+
+    public static void ExitApplication() {
+        // Release held hotkeys and restore audio before the updater replaces the executable.
+        Safe(delegate { if (app != null) app.Shutdown(); });
+        if (icon != null) icon.Visible = false;
+        Log.Close();
+        Application.ExitThread();
+        Environment.Exit(0);
     }
 
     static void ShowMain() {

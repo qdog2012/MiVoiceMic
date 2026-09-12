@@ -9,7 +9,7 @@ on:
       version:
         description: Existing release tag
         required: true
-        default: v1.0.2
+        default: v1.0.3
 
 env:
   RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
@@ -53,6 +53,7 @@ jobs:
             throw 'Application self-tests failed or did not finish'
           }
           & .\tools\test-driver-package.ps1
+          & .\tools\test-app-update.ps1
 
       - name: Prepare downloadable files
         run: |

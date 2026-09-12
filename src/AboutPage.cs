@@ -4,15 +4,40 @@
 using System;
 using System.Drawing;
 using System.Windows.Forms;
+using System.Threading;
+using System.Threading.Tasks;
 
 class AboutPage : MacPage {
     readonly Font titleFont;
     TextBox logBox;
-    Timer logTimer;
+    System.Windows.Forms.Timer logTimer;
     MacButton openCfgBtn, openLogBtn;
+    MacButton checkUpdateBtn, installUpdateBtn, cancelUpdateBtn;
+    Label updateStatus;
+    ProgressBar updateProgress;
+    ToolTip updateTip;
+    CancellationTokenSource updateCancellation;
+    AppRelease availableRelease;
+    bool checkedOnce, updateBusy;
 
     public AboutPage(App app) : base(app) {
         titleFont = MacTheme.Font(14.5f, FontStyle.Bold);
+
+        checkUpdateBtn = new MacButton("检查更新", false, false) { Width = MacTheme.S(100) };
+        checkUpdateBtn.Clicked += delegate { CheckForUpdates(); };
+        installUpdateBtn = new MacButton("下载并更新", true, false) { Width = MacTheme.S(116), Visible = false };
+        installUpdateBtn.Clicked += delegate { InstallUpdate(); };
+        cancelUpdateBtn = new MacButton("取消", false, false) { Width = MacTheme.S(70), Visible = false };
+        cancelUpdateBtn.Clicked += delegate { if (updateCancellation != null) updateCancellation.Cancel(); };
+        updateStatus = new Label { Text = "打开此页时自动检查 GitHub 最新正式版本", AutoEllipsis = true,
+            BackColor = Color.White, ForeColor = MacTheme.TextSecondary, Font = MacTheme.Font(9f) };
+        updateProgress = new ProgressBar { Minimum = 0, Maximum = 100, Visible = false };
+        updateTip = new ToolTip();
+        Controls.Add(checkUpdateBtn);
+        Controls.Add(installUpdateBtn);
+        Controls.Add(cancelUpdateBtn);
+        Controls.Add(updateStatus);
+        Controls.Add(updateProgress);
 
         openCfgBtn = new MacButton("打开 config.json", false, true) { Width = MacTheme.S(152) };
         openCfgBtn.Clicked += delegate { TryStart("notepad.exe", Config.ConfigPath); };
@@ -28,10 +53,114 @@ class AboutPage : MacPage {
         Controls.Add(openCfgBtn);
         Controls.Add(openLogBtn);
 
-        logTimer = new Timer { Interval = 800 };
+        logTimer = new System.Windows.Forms.Timer { Interval = 800 };
         logTimer.Tick += delegate { RefreshLog(); };
         logTimer.Start();
         RefreshLog();
+    }
+
+    public override void OnActivated() {
+        if (!checkedOnce && AppUpdater.Interactive) { checkedOnce = true; CheckForUpdates(); }
+    }
+
+    void UpdateStatus(string text, bool error) {
+        if (IsDisposed) return;
+        updateStatus.Text = text;
+        updateStatus.ForeColor = error ? MacTheme.Red : MacTheme.TextSecondary;
+        updateTip.SetToolTip(updateStatus, text);
+    }
+
+    void SetUpdateBusy(bool busy) {
+        updateBusy = busy;
+        checkUpdateBtn.Enabled = !busy;
+        checkUpdateBtn.Caption = busy ? "请稍候…" : "检查更新";
+        checkUpdateBtn.Invalidate();
+        installUpdateBtn.Visible = !busy && availableRelease != null;
+        cancelUpdateBtn.Visible = busy;
+        Relayout();
+    }
+
+    async void CheckForUpdates() {
+        if (updateBusy) return;
+        availableRelease = null;
+        var cancellation = new CancellationTokenSource();
+        updateCancellation = cancellation;
+        SetUpdateBusy(true);
+        UpdateStatus("正在连接 GitHub，检查最新版本…", false);
+        try {
+            var release = await Task.Run(delegate { return AppUpdater.Check(cancellation.Token); });
+            if (IsDisposed) return;
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (release.IsNewer) {
+                availableRelease = release;
+                UpdateStatus("发现 " + release.Tag + " · 下载后自动重启，保留当前配置", false);
+            } else {
+                UpdateStatus("当前已是最新版本（本机 " + AppVersion.Number + "，GitHub " + release.Tag + "）", false);
+            }
+        } catch (Exception ex) {
+            UpdateStatus(AppUpdater.FriendlyError(ex), !(ex is OperationCanceledException));
+            Log.Warn("[UPDATE] check: " + ex.Message);
+        } finally {
+            updateCancellation = null;
+            cancellation.Dispose();
+            if (!IsDisposed) SetUpdateBusy(false);
+        }
+    }
+
+    async void InstallUpdate() {
+        if (updateBusy || availableRelease == null) return;
+        var release = availableRelease;
+        var cancellation = new CancellationTokenSource();
+        updateCancellation = cancellation;
+        SetUpdateBusy(true);
+        updateProgress.Value = 0;
+        updateProgress.Visible = true;
+        UpdateStatus("正在下载 " + release.Tag + "…", false);
+        string stage = null;
+        bool helperStarted = false;
+        try {
+            // Progress<T> posts onto the UI context; network/disk work never blocks voice input.
+            int lastPercent = -1;
+            var progress = new Progress<int>(delegate(int percent) {
+                if (IsDisposed || !updateBusy) return;
+                updateProgress.Value = percent;
+                UpdateStatus("正在下载 " + release.Tag + " · " + percent + "%", false);
+            });
+            stage = await Task.Run(delegate {
+                return AppUpdater.Prepare(release, delegate(int percent) {
+                    if (percent != lastPercent) { lastPercent = percent; ((IProgress<int>)progress).Report(percent); }
+                }, cancellation.Token);
+            });
+            cancellation.Token.ThrowIfCancellationRequested();
+            if (IsDisposed) return;
+            UpdateStatus("校验通过，正在准备更新…", false);
+            cancelUpdateBtn.Visible = false;
+            await Task.Run(delegate { AppUpdater.StartHelper(stage, cancellation.Token); });
+            helperStarted = true;
+            if (IsDisposed) { System.IO.File.WriteAllText(System.IO.Path.Combine(stage, "cancel"), "cancel"); return; }
+            UpdateStatus("正在重启，更新后将自动重新连接遥控器…", false);
+            Log.Info("[UPDATE] applying " + release.Tag);
+            TrayIcon.ExitApplication();
+        } catch (Exception ex) {
+            UpdateStatus(AppUpdater.FriendlyError(ex), !(ex is OperationCanceledException));
+            Log.Warn("[UPDATE] install: " + ex.Message);
+        } finally {
+            if (stage != null && !helperStarted)
+                AppUpdater.CleanupStage(stage, System.IO.Path.GetDirectoryName(Application.ExecutablePath));
+            updateCancellation = null;
+            cancellation.Dispose();
+            if (!IsDisposed) { updateProgress.Visible = false; SetUpdateBusy(false); }
+        }
+    }
+
+    protected override void Dispose(bool disposing) {
+        if (disposing) {
+            if (updateCancellation != null) updateCancellation.Cancel();
+            if (logTimer != null) logTimer.Dispose();
+            if (updateTip != null) updateTip.Dispose();
+            titleFont.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     static string LogPath() { return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "MiVoiceMic.log"); }
@@ -49,16 +178,26 @@ class AboutPage : MacPage {
         } catch { }
     }
 
-    // layout bands (96dpi logical): 70-202 identity, 214-310 credits, 322-374 files, 386+ log
+    // Separate update card keeps status/progress readable at the minimum window size.
     Rectangle IdCardRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(70), Width - MacTheme.S(52), MacTheme.S(132)); } }
-    Rectangle CrCardRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(214), Width - MacTheme.S(52), MacTheme.S(96)); } }
-    Rectangle FCardRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(322), Width - MacTheme.S(52), MacTheme.S(52)); } }
-    Rectangle LogRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(386), Width - MacTheme.S(52), Height - MacTheme.S(386) - MacTheme.S(20)); } }
+    Rectangle UpdateCardRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(214), Width - MacTheme.S(52), MacTheme.S(96)); } }
+    Rectangle CrCardRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(322), Width - MacTheme.S(52), MacTheme.S(96)); } }
+    Rectangle FCardRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(430), Width - MacTheme.S(52), MacTheme.S(52)); } }
+    Rectangle LogRect { get { return new Rectangle(MacTheme.S(26), MacTheme.S(494), Width - MacTheme.S(52), Height - MacTheme.S(494) - MacTheme.S(20)); } }
 
     protected override void OnResize(EventArgs e) {
         base.OnResize(e);
-        openCfgBtn.Location = new Point(Width - MacTheme.S(26) - openCfgBtn.Width - MacTheme.S(12) - openLogBtn.Width, MacTheme.S(332));
-        openLogBtn.Location = new Point(Width - MacTheme.S(26) - openLogBtn.Width, MacTheme.S(332));
+        if (openCfgBtn == null) return;
+        var updateRect = UpdateCardRect;
+        installUpdateBtn.Location = new Point(updateRect.Right - MacTheme.S(18) - installUpdateBtn.Width, updateRect.Y + MacTheme.S(14));
+        cancelUpdateBtn.Location = new Point(updateRect.Right - MacTheme.S(18) - cancelUpdateBtn.Width, installUpdateBtn.Top);
+        int checkRight = updateBusy ? cancelUpdateBtn.Left - MacTheme.S(10) :
+            availableRelease != null ? installUpdateBtn.Left - MacTheme.S(10) : updateRect.Right - MacTheme.S(18);
+        checkUpdateBtn.Location = new Point(checkRight - checkUpdateBtn.Width, installUpdateBtn.Top);
+        updateStatus.Bounds = new Rectangle(updateRect.X + MacTheme.S(18), updateRect.Y + MacTheme.S(57), updateRect.Width - MacTheme.S(36), MacTheme.S(22));
+        updateProgress.Bounds = new Rectangle(updateStatus.Left, updateRect.Bottom - MacTheme.S(10), updateStatus.Width, MacTheme.S(4));
+        openCfgBtn.Location = new Point(Width - MacTheme.S(26) - openCfgBtn.Width - MacTheme.S(12) - openLogBtn.Width, MacTheme.S(440));
+        openLogBtn.Location = new Point(Width - MacTheme.S(26) - openLogBtn.Width, MacTheme.S(440));
         var logRect = LogRect;
         logBox.Bounds = new Rectangle(logRect.X + MacTheme.S(10), logRect.Y + MacTheme.S(36), logRect.Width - MacTheme.S(20), Math.Max(0, logRect.Height - MacTheme.S(46)));
         Invalidate();
@@ -89,10 +228,16 @@ class AboutPage : MacPage {
         float tx = logo.Right + MacTheme.S(18);
         Gfx.Text(g, "MiVoiceMic", MacTheme.Font(12.5f, FontStyle.Bold), MacTheme.TextPrimary,
             new RectangleF(tx, idCard.Y + MacTheme.S(20), MacTheme.S(300), MacTheme.S(22)), StringAlignment.Near);
-        Gfx.Text(g, "把小米蓝牙遥控器 2 Pro 变成 Windows 无线麦克风 — 按住语音键说话，松开上屏", MacTheme.Font(9f), MacTheme.TextSecondary,
+        Gfx.Text(g, "小米蓝牙遥控器 2 Pro · 按住语音键说话，松开上屏", MacTheme.Font(9f), MacTheme.TextSecondary,
             new RectangleF(tx, idCard.Y + MacTheme.S(56), idCard.Width - MacTheme.S(240), MacTheme.S(18)), StringAlignment.Near);
-        Gfx.Text(g, "版本 1.0 · GPL-3.0 · 仅供学习交流，与小米/腾讯无关", MacTheme.Font(8.5f), MacTheme.TextTertiary,
+        Gfx.Text(g, "版本 " + AppVersion.Number + " · GPL-3.0 · 仅供学习交流，与小米/腾讯无关", MacTheme.Font(8.5f), MacTheme.TextTertiary,
             new RectangleF(tx, idCard.Y + MacTheme.S(86), idCard.Width - MacTheme.S(240), MacTheme.S(16)), StringAlignment.Near);
+
+        var updateCard = UpdateCardRect;
+        DrawCard(g, updateCard);
+        using (var f = MacTheme.Font(10.5f, FontStyle.Bold))
+            Gfx.Text(g, "软件更新", f, MacTheme.TextPrimary,
+                new RectangleF(updateCard.X + MacTheme.S(18), updateCard.Y + MacTheme.S(20), MacTheme.S(160), MacTheme.S(22)), StringAlignment.Near);
 
         // credits card
         var crCard = CrCardRect;
@@ -115,10 +260,14 @@ class AboutPage : MacPage {
         // files card
         var fCard = FCardRect;
         DrawCard(g, fCard);
-        Gfx.Text(g, "配置  " + Config.ConfigPath, MacTheme.Font(8.5f), MacTheme.TextSecondary,
-            new RectangleF(fCard.X + MacTheme.S(18), fCard.Y + MacTheme.S(8), fCard.Width - MacTheme.S(280), MacTheme.S(16)), StringAlignment.Near);
-        Gfx.Text(g, "日志  " + LogPath(), MacTheme.Font(8.5f), MacTheme.TextSecondary,
-            new RectangleF(fCard.X + MacTheme.S(18), fCard.Y + MacTheme.S(28), fCard.Width - MacTheme.S(280), MacTheme.S(16)), StringAlignment.Near);
+        using (var f = MacTheme.Font(8.5f)) {
+            TextRenderer.DrawText(g, "配置  " + Config.ConfigPath, f,
+                new Rectangle(fCard.X + MacTheme.S(18), fCard.Y + MacTheme.S(8), Math.Max(0, openCfgBtn.Left - fCard.X - MacTheme.S(30)), MacTheme.S(16)),
+                MacTheme.TextSecondary, TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+            TextRenderer.DrawText(g, "日志  " + LogPath(), f,
+                new Rectangle(fCard.X + MacTheme.S(18), fCard.Y + MacTheme.S(28), Math.Max(0, openCfgBtn.Left - fCard.X - MacTheme.S(30)), MacTheme.S(16)),
+                MacTheme.TextSecondary, TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+        }
 
         // log card frame
         var logRect = LogRect;

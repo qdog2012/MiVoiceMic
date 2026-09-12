@@ -22,6 +22,8 @@ static class Program {
     [STAThread]
     static int Main(string[] args) {
         string mode = args != null && args.Length > 0 ? args[0].ToLowerInvariant() : "";
+        // The copied update helper must never initialize Bluetooth, hooks, config or a console.
+        if (mode == "--apply-update") return AppUpdater.RunHelper();
         // winexe build has no console; tool modes re-attach to the calling
         // terminal (or allocate one) so --check/--sniff/--e2e output is visible
         if (mode.Length > 0 && !AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
@@ -32,6 +34,13 @@ static class Program {
         if (mode == "--sniff") return Sniffer.Run(args.Length > 1 ? int.Parse(args[1]) : 20);
         if (mode == "--e2e") return E2E.Run(args);
         if (mode == "--screenshot") return Screenshot.Run(args);
+        if (mode == "--check-update") {
+            try {
+                var release = AppUpdater.Check(CancellationToken.None);
+                Console.WriteLine("Current: " + AppVersion.Number + "; GitHub: " + release.Tag + "; update: " + release.IsNewer);
+                return 0;
+            } catch (Exception ex) { Console.WriteLine(AppUpdater.FriendlyError(ex)); return 1; }
+        }
 
         Log.Init(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "MiVoiceMic.log"));
         Log.Info("MiVoiceMic starting (pid " + Process.GetCurrentProcess().Id + ")");
@@ -42,6 +51,7 @@ static class Program {
         var app = new App(cfg);
         app.Run();
         System.Windows.Forms.Application.EnableVisualStyles();
+        AppUpdater.Interactive = true;
         MacTheme.Init();
         var main = new MainWindow(app);
         TrayIcon.MainWindow = main;
