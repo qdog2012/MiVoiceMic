@@ -1,5 +1,5 @@
 // RemoteKeys.cs - driverless key remapping for the remote's Windows-visible keys
-// (voice=F5, arrows, OK/Enter). Replaces VoiceKeyBlocker as the single
+// (voice=F5 or driver F20, arrows, OK/Enter). Replaces VoiceKeyBlocker as the single
 // WH_KEYBOARD_LL owner.
 //
 // Attribution: the low-level hook cannot see which device a key came from, but
@@ -25,11 +25,12 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 
 static class InputRouter {
     // ---- hook -------------------------------------------------------------
     delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
@@ -43,17 +44,24 @@ static class InputRouter {
     [StructLayout(LayoutKind.Sequential)] struct KBDLLHOOKSTRUCT { public uint vkCode; public uint scanCode; public uint flags; public uint time; public IntPtr extra; }
 
     const int WH_KEYBOARD_LL = 13;
-    const uint WM_APP_REHOOK = 0x8000;
+    const uint WM_REFRESH_VOICE_HOOK = 0x8001;
+    const uint WM_QUIT = 0x0012;
     const uint LLKHF_INJECTED = 0x10;
     const ushort VK_F5 = 0x74;
+    const ushort VK_F20 = 0x83;            // MiRemoteHidFilter remaps the voice key to F20
 
     static readonly HookProc proc = HookCb;
     static volatile IntPtr hhk = IntPtr.Zero;
     static Thread pump;
-    static uint pumpTid;
-    static volatile bool blockF5;         // swallow remote/physical F5 while linked
+    static volatile uint pumpTid;
+    static readonly object hookGate = new object();
+    static bool routerStopping;
+    static readonly ConcurrentQueue<TaskCompletionSource<bool>> hookRefreshes =
+        new ConcurrentQueue<TaskCompletionSource<bool>>();
+    static volatile bool blockF5;         // block voice HID events, including driver F20
     static volatile bool linked;          // BLE link connected
     public static long SwallowedCount;
+    public static long SwallowedVoiceKeyCount;
     static int lastPassLogTick;           // hook thread only: throttle passthrough notes
 
     // ---- mapping state ----------------------------------------------------
@@ -93,7 +101,7 @@ static class InputRouter {
                 if ((k.flags & LLKHF_INJECTED) == 0) {          // never touch injected input
                     bool down = wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104;
                     uint vk = k.vkCode;
-                    bool f5Case = vk == VK_F5 && blockF5;        // legacy blocker semantics
+                    bool f5Case = (vk == VK_F5 || vk == VK_F20) && blockF5;
                     bool mapCase = false;
                     if (mappingEnabled) lock (mapGate) mapCase = engine.HasBinding(vk);
                     if (mapCase && !down && pendingDowns.Count > 0) {
@@ -109,6 +117,7 @@ static class InputRouter {
                         if (mapCase) remote = RawSink.LooksFromRemote();
                         if (remote) {
                             Interlocked.Increment(ref SwallowedCount);
+                            if (f5Case) Interlocked.Increment(ref SwallowedVoiceKeyCount);
                             if (mapCase) {
                                 RawSink.NoteRemoteActivity();    // swallowed keys produce no WM_INPUT - latch the burst
                                 mapQueue.TryAdd(new GestureEngine.RawEvent { Vk = (ushort)vk, Down = down, TickMs = NowMs() });
@@ -127,6 +136,7 @@ static class InputRouter {
                         }
                         if (f5Case) {                            // physical F5 while linked: still swallowed (old behavior)
                             Interlocked.Increment(ref SwallowedCount);
+                            Interlocked.Increment(ref SwallowedVoiceKeyCount);
                             return (IntPtr)1;
                         }
                         if (mapCase && !down) {                  // evidence flipped mid-press: still let the engine finish its state
@@ -182,8 +192,8 @@ static class InputRouter {
     static long NowMs() { return DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond; }
 
     /// Unit-test hook: simulate a key event and return the verdict (1 = swallowed).
-    internal static IntPtr TestDispatch(uint vk, bool down, bool fromRemote) {
-        var k = new KBDLLHOOKSTRUCT { vkCode = vk };
+    internal static IntPtr TestDispatch(uint vk, bool down, bool fromRemote, bool injected = false) {
+        var k = new KBDLLHOOKSTRUCT { vkCode = vk, flags = injected ? LLKHF_INJECTED : 0 };
         IntPtr mem = Marshal.AllocHGlobal(Marshal.SizeOf(k));
         try {
             Marshal.StructureToPtr(k, mem, false);
@@ -195,16 +205,28 @@ static class InputRouter {
     public static void Start() {
         if (pump != null) return;
         pump = new Thread((ThreadStart)delegate {
-            pumpTid = GetCurrentThreadId();
-            hhk = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
-            Log.Info("[INPUT] router armed (blockF5 " + (blockF5 ? "on" : "off") +
+            try {
+              if (RefreshHook()) Log.Info("[INPUT] router armed (voice F5/F20 blocker " + (blockF5 ? "on" : "off") +
                      ", mapping " + (mappingEnabled ? "on" : "off") + " while linked)");
-            MSG m;
-            while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) {
-                if (m.message == WM_APP_REHOOK && hhk == IntPtr.Zero && suspendDepth == 0)
-                    hhk = SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
+              pumpTid = GetCurrentThreadId();
+              MSG m;
+              while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) {
+                if (m.message == WM_REFRESH_VOICE_HOOK) {
+                    TaskCompletionSource<bool> request;
+                    while (hookRefreshes.TryDequeue(out request))
+                        if (!request.Task.IsCompleted) request.TrySetResult(RefreshHook());
+                    continue;
+                }
                 TranslateMessage(ref m);
                 DispatchMessage(ref m);
+              }
+            } finally {
+                pumpTid = 0;
+                lock (hookGate) {
+                    if (hhk != IntPtr.Zero) { UnhookWindowsHookEx(hhk); hhk = IntPtr.Zero; }
+                }
+                TaskCompletionSource<bool> request;
+                while (hookRefreshes.TryDequeue(out request)) request.TrySetResult(false);
             }
         }) { IsBackground = true, Name = "inputrouter" };
         pump.Start();
@@ -232,8 +254,49 @@ static class InputRouter {
     }
 
     public static void Stop() {
-        if (hhk != IntPtr.Zero) { UnhookWindowsHookEx(hhk); hhk = IntPtr.Zero; }
+        lock (hookGate) {
+            routerStopping = true;
+            if (hhk != IntPtr.Zero) { UnhookWindowsHookEx(hhk); hhk = IntPtr.Zero; }
+        }
+        uint tid = pumpTid;
+        if (tid != 0) PostThreadMessage(tid, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         RawSink.Stop();
+    }
+
+    // Windows calls the newest low-level hook first. An IME started/rearmed
+    // after us can see a voice key even when we swallow it later in the chain.
+    // Replace on the owning message-pump thread, BEFORE clearing stale key
+    // state and sending the combo. Never leave the input path unfiltered.
+    public static bool RefreshVoiceBlocker() {
+        uint tid = pumpTid;
+        if (!linked || !blockF5 || tid == 0) return false;
+        var request = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        hookRefreshes.Enqueue(request);
+        if (!PostThreadMessage(tid, WM_REFRESH_VOICE_HOOK, IntPtr.Zero, IntPtr.Zero)) request.TrySetResult(false);
+        if (!request.Task.Wait(500)) request.TrySetResult(false);
+        bool refreshed = request.Task.Result;
+        if (!refreshed) Log.Warn("[INPUT] 语音键拦截顺序刷新失败，保留原拦截器");
+        return refreshed;
+    }
+
+    static bool RefreshHook() {
+        lock (hookGate) {
+            if (routerStopping) return false;
+            IntPtr previous = hhk;
+            hhk = ReplaceHook(previous,
+                delegate { return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0); },
+                delegate(IntPtr old) { UnhookWindowsHookEx(old); });
+            if (hhk != previous) return true;
+            Log.Warn("[INPUT] 安装键盘拦截失败，系统错误=" + Marshal.GetLastWin32Error());
+            return false;
+        }
+    }
+
+    internal static IntPtr ReplaceHook(IntPtr previous, Func<IntPtr> install, Action<IntPtr> remove) {
+        IntPtr next = install();
+        if (next == IntPtr.Zero) return previous;
+        if (previous != IntPtr.Zero) remove(previous);
+        return next;
     }
 
     public static void SetBlockF5(bool on) { blockF5 = on; }
@@ -315,17 +378,8 @@ static class InputRouter {
         args = command.Substring(sp + 1).Trim();
     }
 
-    // ---- injection-time hook suspension (shared with HotkeyInjector) -------
-    static int suspendDepth;
-    public static void Suspend() {
-        if (Interlocked.Increment(ref suspendDepth) == 1 && hhk != IntPtr.Zero) {
-            UnhookWindowsHookEx(hhk); hhk = IntPtr.Zero;
-        }
-    }
-    public static void Resume() {
-        if (Interlocked.Decrement(ref suspendDepth) == 0 && pumpTid != 0)
-            PostThreadMessage(pumpTid, WM_APP_REHOOK, IntPtr.Zero, IntPtr.Zero);
-    }
+    // Keep the hook installed during SendInput. Injected events already bypass
+    // HookCb, while real F5/F20 repeats must remain blocked throughout the combo.
 }
 
 // ---- gesture engine (pure logic, unit-testable) ---------------------------
@@ -464,18 +518,14 @@ static class KeySender {
         var inputs = new List<INPUT>();
         for (int i = 0; i < keys.Length; i++) inputs.Add(Make(keys[i], true));
         for (int i = keys.Length - 1; i >= 0; i--) inputs.Add(Make(keys[i], false));
-        InputRouter.Suspend();
-        try { SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT))); }
-        finally { InputRouter.Resume(); }
+        SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT)));
     }
 
     static void SendAll(ushort[] keys, bool down) {
         var inputs = new INPUT[keys.Length];
         int idx = 0;
         for (int i = 0; i < keys.Length; i++) inputs[idx++] = down ? Make(keys[i], true) : Make(keys[keys.Length - 1 - i], false);
-        InputRouter.Suspend();
-        try { SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT))); }
-        finally { InputRouter.Resume(); }
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 }
 

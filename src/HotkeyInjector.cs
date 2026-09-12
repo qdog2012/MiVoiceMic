@@ -1,13 +1,13 @@
 // HotkeyInjector.cs - SendInput-based combo hold/release/tap for the IME voice
 // hotkey (WeType default: Ctrl+Win), plus key-name parsing.
 //
-// Two proven subtleties (from RemoteMapper NOTES.md):
+// Injection details:
 //  1. Right Alt is an EXTENDED key - must set KEYEVENTF_EXTENDEDKEY or the IME
 //     sees Left Alt and triggers its own behaviour.
-//  2. While the remote's voice key is held, the remote spams HID F5. Our
-//     low-level keyboard hook marshals ALL system input through the hook thread,
-//     and that traffic disturbs injection timing. So we suspend the hook while
-//     injecting and re-install it afterwards from the pump thread.
+//  2. The remote sends HID F5 (F20 with MiRemoteHidFilter) while held. Keep the
+//     input hook installed throughout injection. Move it ahead of newer hooks
+//     and release stale voice-key state before the combo; simply swallowing an
+//     event does not hide it from hooks earlier in the chain.
 // 中文：SendInput 组合键注入 —— 输入法语音热键的按住/点按控制
 using System;
 using System.Collections.Generic;
@@ -138,7 +138,8 @@ sealed class HotkeyInjector : IVoiceHotkey {
         uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
         int error = Marshal.GetLastWin32Error();
         string detail = "[KEY] " + action + " " + KeyMapNames.FriendlyCombo(keys) +
-            ": " + sent + "/" + inputs.Length + "，前台应用=" + target;
+            ": " + sent + "/" + inputs.Length + "，前台应用=" + target +
+            "，累计拦截语音键事件=" + System.Threading.Interlocked.Read(ref InputRouter.SwallowedVoiceKeyCount);
         if (sent == inputs.Length) Log.Info(detail);
         else Log.Warn(detail + "，系统错误=" + error);
         return sent == inputs.Length;
@@ -152,46 +153,43 @@ sealed class HotkeyInjector : IVoiceHotkey {
     /// Release stale keys before the cancellable settling period.
     public void PrepareVoiceDown() {
         if (combo.Length == 0) return;
-        InputRouter.Suspend();
-        try {
-            foreach (ushort vk in combo) ForcedRelease(vk);   // clean slate
-        } finally { InputRouter.Resume(); }
+        if (InputRouter.RefreshVoiceBlocker()) {
+            // The IME may already have observed the first physical voice-key
+            // DOWN before our hook. Send only UPs to clear its tracked state;
+            // subsequent physical repeats stay blocked by the refreshed hook.
+            ForcedRelease(0x74);
+            ForcedRelease(0x83);
+            Log.Info("[KEY] 已刷新语音键拦截顺序并清理 F5/F20 按下状态");
+        }
+        foreach (ushort vk in combo) ForcedRelease(vk);   // clean slate
         System.Threading.Thread.Sleep(50);
     }
 
     /// Caller rechecks session validity after PrepareVoiceDown, before committing.
     public void OnVoiceDown() {
         if (combo.Length == 0) return;
-        InputRouter.Suspend();
-        try {
-            if (tapMode) {
-                if (!TapOnce(combo)) Log.Warn("[KEY] tap down failed");
-            } else {
-                if (!PressAll(combo)) Log.Warn("[KEY] press failed");
-            }
-        } finally { InputRouter.Resume(); }
+        if (tapMode) {
+            if (!TapOnce(combo)) Log.Warn("[KEY] tap down failed");
+        } else {
+            if (!PressAll(combo)) Log.Warn("[KEY] press failed");
+        }
     }
 
     /// Voice key released.
     public void OnVoiceUp() {
         if (combo.Length == 0) return;
-        InputRouter.Suspend();
-        try {
-            if (tapMode) {
-                if (!TapOnce(combo)) Log.Warn("[KEY] tap up failed");
-            } else {
-                if (!ReleaseAll(combo)) Log.Warn("[KEY] release failed");
-            }
-        } finally { InputRouter.Resume(); }
+        if (tapMode) {
+            if (!TapOnce(combo)) Log.Warn("[KEY] tap up failed");
+        } else {
+            if (!ReleaseAll(combo)) Log.Warn("[KEY] release failed");
+        }
     }
 
     /// Safety net: release held keys (on exit / link loss).
     public void ForceRelease() {
         if (combo.Length == 0) return;
-        InputRouter.Suspend();
         try {
             foreach (ushort vk in combo) ForcedRelease(vk);
         } catch (Exception ex) { Log.Warn("[KEY] force release: " + ex.Message); }
-        finally { InputRouter.Resume(); }
     }
 }

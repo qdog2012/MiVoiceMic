@@ -168,7 +168,7 @@ sealed class App : BleVoiceLink.IHandler {
         }
         InputRouter.SetBlockF5(updated.blockF5);
         InputRouter.SetKeyMap(updated.keymap, updated.deviceMacPrefix);
-        Log.Info("[CFG] 热键: " + injector.Describe() + " | 拦截F5: " + (updated.blockF5 ? "开" : "关") +
+        Log.Info("[CFG] 热键: " + injector.Describe() + " | 拦截语音键 F5/F20: " + (updated.blockF5 ? "开" : "关") +
                  " | 按键映射: " + (updated.keymap.enabled ? "开" : "关"));
     }
 

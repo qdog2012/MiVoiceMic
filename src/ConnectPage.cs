@@ -422,7 +422,7 @@ class ConnectPage : MacPage {
 
     void PaintRemoteContent(Graphics g) {
         int w = remoteCard.Width;
-        Gfx.Text(g, "拦截语音键发出的 F5", bodyFont, MacTheme.TextPrimary,
+        Gfx.Text(g, "拦截语音键附带的键盘信号", bodyFont, MacTheme.TextPrimary,
             new RectangleF(MacTheme.S(16), MacTheme.S(36), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
         Gfx.Text(g, "扫描到未配对遥控器时自动配对", bodyFont, MacTheme.TextPrimary,
             new RectangleF(MacTheme.S(16), MacTheme.S(68), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);

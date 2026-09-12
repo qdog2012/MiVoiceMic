@@ -56,7 +56,7 @@ class Config {
     public StatsConfig stats = new StatsConfig();
 
     // keyboard
-    public bool blockF5 = true;           // swallow the remote's voice-key F5 while linked
+    public bool blockF5 = true;           // swallow voice F5 or driver F20 while linked (keep saved key name)
 
     // misc
     public bool dumpAudio = false;        // save each voice session to wav (next to the exe)

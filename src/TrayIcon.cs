@@ -53,7 +53,7 @@ static class TrayIcon {
         }
         menu.Items.Add(miPreset);
 
-        miBlockF5 = new ToolStripMenuItem("拦截遥控器语音键的 F5", null, delegate { ToggleBlockF5(); });
+        miBlockF5 = new ToolStripMenuItem("拦截语音键附带的键盘信号", null, delegate { ToggleBlockF5(); });
         miBlockF5.Checked = app.Config.blockF5;
         miSwitchMic = new ToolStripMenuItem("说话时自动切换默认麦克风", null, delegate { ToggleSwitchMic(); });
         miSwitchMic.Checked = app.Config.switchDefaultMic;

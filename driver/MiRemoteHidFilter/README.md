@@ -23,10 +23,13 @@
 | 菜单 | `0x65` | F17 `0x6C` | `0x80` |
 | 直播 | `0x35` | F18 `0x6D` | `0x81` |
 | 电源 | `0x66` | F19 `0x6E` | `0x82` |
+| 语音 | F5 `0x3E` | F20 `0x6F` | `0x83` |
+
+语音键的音频通知仍走 ATVV。应用需拦截同时发出的 F20 键盘事件，避免干扰输入法的语音快捷键；仅拦截原始 F5 不够。
 
 前三个 usage 原本会被 `kbdhid.sys` 丢弃；后四个本可映射为 Home / Apps / OEM_3 / Power，但全局低级键盘钩子没有来源设备 ID，直接映射会误吞物理键盘的同名键。因此把它们改为 F16–F19，仅由此 VID/PID 的遥控器生成。
 
-未映射的确定与方向键保持原样，保留其原生按住/重复行为。若未来要为这些普通键增加组合键映射，必须先在此 filter 分配未使用的 F20–F24，再在 `keymap.txt` 使用对应 VK；不要直接把 `VK_ENTER` / 方向 VK 设为映射源。
+未映射的确定与方向键保持原样，保留其原生按住/重复行为。F20 已保留给语音键，后续扩展驱动映射不能重复占用。
 
 ## 报告格式与实现
 
@@ -117,6 +120,10 @@ build.bat Release
 ## 安装测试签名包
 
 > `package/` 是 WDK 测试证书签名的开发包。它需要 Windows TESTSIGNING；关闭测试模式后不能继续加载。
+
+安装前可运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\verify-package.ps1`，检查签名目录是否与 INF、SYS 的实际内容一致；此检查不会安装证书或修改系统设置。签名包必须保留原始字节，包括 INF 的 CRLF 换行，仓库通过 `.gitattributes` 禁止 Git 对包内文件转换换行。不要直接修改 `package/` 中的 INF。
+
+安装脚本会检查**本次启动实际生效**的测试模式，避免只修改启动选项、尚未重启就继续安装。`install-driver.ps1 -CheckOnly` 只检查安装前提。准备和安装的日志保存在 `%LOCALAPPDATA%\MiVoiceMic\driver-logs\`；退出码 3010 表示成功但需重启。若 Windows 已自动重新加载设备、驱动运行且目标设备无错误，脚本会提示当前无需再次重启。
 
 1. 确认 Secure Boot 已关闭。
 2. 管理员运行：

@@ -50,6 +50,8 @@ RemoteMapper 作者用 Android `getevent` 做对照确认：遥控器确实发�
 
 ## 3. 本项目的方案：内置测试签名驱动
 
+如果安装报 `0xE000024B`（INF 哈希不在签名目录中），是驱动包完整性校验失败。曾发现 Git 将已签名 INF 的 CRLF 换行转换成 LF，导致安装失败；必须恢复与原 CAT 匹配的完整驱动包，关闭校验不能修复这个问题。可用 `driver\MiRemoteHidFilter\verify-package.ps1` 只读检查，安装日志位于 `%LOCALAPPDATA%\MiVoiceMic\driver-logs\`。
+
 按键映射页的 **「安装内核驱动（高级）」** 按钮会调起 `driver\MiRemoteHidFilter\` 里
 RemoteMapper 项目的官方安装脚本（自动弹 UAC 提权）：
 

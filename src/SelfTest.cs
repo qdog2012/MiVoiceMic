@@ -24,6 +24,7 @@ static class SelfTest {
         TestConfigRoundtrip();
         TestWavWriter();
         TestF5Blocker();
+        TestHookReplacement();
         TestKeyMap();
         TestChargeState();
         TestLooksFromRemote();
@@ -56,6 +57,26 @@ static class SelfTest {
         Check(guard.TimeoutReason(309000) == null, "voice: continuous audio survives ordinary pauses in speech");
         guard.Audio(310000);
         Check(guard.TimeoutReason(310000) != null, "voice: hard limit ends endless audio without STOP");
+    }
+
+    static void TestHookReplacement() {
+        var live = new HashSet<IntPtr> { (IntPtr)1 };
+        bool coveredDuringInstall = false, coveredDuringRemoval = false;
+        IntPtr next = InputRouter.ReplaceHook((IntPtr)1, delegate {
+            coveredDuringInstall = live.Contains((IntPtr)1);
+            live.Add((IntPtr)2);
+            return (IntPtr)2;
+        }, delegate(IntPtr old) {
+            coveredDuringRemoval = live.Contains((IntPtr)2);
+            live.Remove(old);
+        });
+        Check(coveredDuringInstall && coveredDuringRemoval && next == (IntPtr)2 && live.Count == 1,
+            "voice: moving blocker ahead of IME never opens an unfiltered gap");
+        next = InputRouter.ReplaceHook(next, delegate { return IntPtr.Zero; }, delegate(IntPtr old) { live.Remove(old); });
+        Check(next == (IntPtr)2 && live.Contains(next), "voice: failed hook replacement retains existing blocker");
+        bool removed = false;
+        next = InputRouter.ReplaceHook(IntPtr.Zero, delegate { return (IntPtr)3; }, delegate(IntPtr old) { removed = true; });
+        Check(next == (IntPtr)3 && !removed, "voice: first hook installation does not remove an invalid handle");
     }
 
     sealed class FakeVoiceHotkey : IVoiceHotkey {
@@ -323,6 +344,23 @@ static class SelfTest {
         Check(swallowed == (IntPtr)1 && mid == before + 1, "hook swallows F5 while linked");
         Check(passed != (IntPtr)1 && afterLinked == mid, "hook passes non-F5 while linked");
         Check(passedWhenUnlinked != (IntPtr)1 && end == afterLinked, "hook passes F5 when unlinked");
+        Check(InputRouter.TestDispatch(0x83, true) == (IntPtr)1, "voice: driver F20 down is blocked even with key mapping off");
+        Check(InputRouter.TestDispatch(0x83, true) == (IntPtr)1, "voice: held F20 repeats cannot disturb the IME combo");
+        Check(InputRouter.TestDispatch(0x83, false) == (IntPtr)1, "voice: driver F20 up is blocked");
+        Check(InputRouter.TestDispatch(0xA2, true, true, true) != (IntPtr)1 &&
+              InputRouter.TestDispatch(0x5B, true, true, true) != (IntPtr)1 &&
+              InputRouter.TestDispatch(0xA2, false, true, true) != (IntPtr)1 &&
+              InputRouter.TestDispatch(0x5B, false, true, true) != (IntPtr)1,
+              "voice: Ctrl+Win injection passes the installed blocker on press and release");
+        Check(InputRouter.TestDispatch(0x83, true, true, true) != (IntPtr)1,
+              "voice: injected F20 remains usable as a configured output shortcut");
+        InputRouter.SetBlockF5(false);
+        Check(InputRouter.TestDispatch(0x74, true) != (IntPtr)1 && InputRouter.TestDispatch(0x83, true) != (IntPtr)1,
+              "voice: disabling the blocker passes both raw and driver voice keys");
+        InputRouter.SetBlockF5(true);
+        InputRouter.SetLinked(false);
+        Check(InputRouter.TestDispatch(0x83, true) != (IntPtr)1, "voice: F20 follows existing disconnected passthrough behavior");
+        InputRouter.SetLinked(true);
     }
 
     static void TestKeyMap() {
