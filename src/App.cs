@@ -252,6 +252,7 @@ sealed class App : BleVoiceLink.IHandler {
     // ======================= BleVoiceLink.IHandler =======================
 
     public void OnLinkState(bool connected, string detail) {
+        if (connected) InputRouter.RefreshVoiceDriver();
         InputRouter.SetLinked(connected);
         if (connected) {
             Log.Info("[LINK] 已连接: " + detail);

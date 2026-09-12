@@ -21,6 +21,7 @@ if not exist "%CSC%" (
   /r:System.Windows.Forms.dll ^
   /r:System.Drawing.dll ^
   /r:System.Web.Extensions.dll ^
+  /r:System.ServiceProcess.dll ^
   /r:"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Speech\v4.0_4.0.0.0__31bf3856ad364e35\System.Speech.dll" ^
   /out:MiVoiceMic.new.exe ^
   src\Log.cs src\Config.cs src\KeyMap.cs src\AdpcmDecoder.cs src\AudioOut.cs src\DeviceSwitcher.cs ^

@@ -157,9 +157,9 @@ sealed class HotkeyInjector : IVoiceHotkey {
             // The IME may already have observed the first physical voice-key
             // DOWN before our hook. Send only UPs to clear its tracked state;
             // subsequent physical repeats stay blocked by the refreshed hook.
-            ForcedRelease(0x74);
-            ForcedRelease(0x83);
-            Log.Info("[KEY] 已刷新语音键拦截顺序并清理 F5/F20 按下状态");
+            ushort[] voiceKeys = InputRouter.VoiceKeysToRelease();
+            foreach (ushort vk in voiceKeys) ForcedRelease(vk);
+            Log.Info("[KEY] 已刷新语音键拦截顺序并清理 " + KeyMapNames.FriendlyCombo(voiceKeys) + " 按下状态");
         }
         foreach (ushort vk in combo) ForcedRelease(vk);   // clean slate
         System.Threading.Thread.Sleep(50);

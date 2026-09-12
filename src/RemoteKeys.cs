@@ -24,6 +24,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.ServiceProcess;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -60,6 +61,7 @@ static class InputRouter {
         new ConcurrentQueue<TaskCompletionSource<bool>>();
     static volatile bool blockF5;         // block voice HID events, including driver F20
     static volatile bool linked;          // BLE link connected
+    static volatile bool voiceDriverRunning; // the installed filter emits F20, never F5
     public static long SwallowedCount;
     public static long SwallowedVoiceKeyCount;
     static int lastPassLogTick;           // hook thread only: throttle passthrough notes
@@ -101,6 +103,11 @@ static class InputRouter {
                 if ((k.flags & LLKHF_INJECTED) == 0) {          // never touch injected input
                     bool down = wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104;
                     uint vk = k.vkCode;
+                    // In driver mode F5 belongs to the physical keyboard. Pass
+                    // it before mapping as well, since older configs can still
+                    // have the remote's pre-driver voice binding under F5.
+                    if (vk == VK_F5 && voiceDriverRunning)
+                        return CallNextHookEx(hhk, nCode, wParam, lParam);
                     bool f5Case = (vk == VK_F5 || vk == VK_F20) && blockF5;
                     bool mapCase = false;
                     if (mappingEnabled) lock (mapGate) mapCase = engine.HasBinding(vk);
@@ -134,7 +141,7 @@ static class InputRouter {
                             }
                             return (IntPtr)1;
                         }
-                        if (f5Case) {                            // physical F5 while linked: still swallowed (old behavior)
+                        if (f5Case) {                            // legacy driverless F5 blocker
                             Interlocked.Increment(ref SwallowedCount);
                             Interlocked.Increment(ref SwallowedVoiceKeyCount);
                             return (IntPtr)1;
@@ -204,6 +211,7 @@ static class InputRouter {
 
     public static void Start() {
         if (pump != null) return;
+        RefreshVoiceDriver();
         pump = new Thread((ThreadStart)delegate {
             try {
               if (RefreshHook()) Log.Info("[INPUT] router armed (voice F5/F20 blocker " + (blockF5 ? "on" : "off") +
@@ -302,6 +310,27 @@ static class InputRouter {
     public static void SetBlockF5(bool on) { blockF5 = on; }
     public static void SetLinked(bool on) { linked = on; }
     public static void SetMappingEnabled(bool on) { mappingEnabled = on; }
+
+    // Query the live driver, not just an installed package/registry entry.
+    // Run outside the keyboard hook, at startup and on each BLE connection.
+    public static void RefreshVoiceDriver() {
+        bool running = false;
+        try {
+            using (var service = new ServiceController("MiRemoteHidFilter"))
+                running = service.Status == ServiceControllerStatus.Running;
+        } catch (InvalidOperationException) { } // not installed
+        catch (Exception ex) { Log.Warn("[INPUT] 检查遥控器驱动: " + ex.Message); }
+        SetVoiceDriverRunning(running);
+        Log.Info(running
+            ? "[INPUT] 遥控器驱动已运行：语音键使用 F20，普通键盘 F5 放行"
+            : "[INPUT] 遥控器驱动未运行：使用 F5/F20 兼容拦截模式");
+    }
+
+    internal static void SetVoiceDriverRunning(bool running) { voiceDriverRunning = running; }
+
+    internal static ushort[] VoiceKeysToRelease() {
+        return voiceDriverRunning ? new ushort[] { VK_F20 } : new ushort[] { VK_F5, VK_F20 };
+    }
 
     /// Swap in a new mapping table (config edit / preset load). Safe at any time.
     public static void SetKeyMap(KeyMapConfig map) { SetKeyMap(map, null); }

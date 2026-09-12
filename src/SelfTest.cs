@@ -24,6 +24,7 @@ static class SelfTest {
         TestConfigRoundtrip();
         TestWavWriter();
         TestF5Blocker();
+        TestDriverF5Passthrough();
         TestHookReplacement();
         TestKeyMap();
         TestChargeState();
@@ -329,6 +330,7 @@ static class SelfTest {
 
     static void TestF5Blocker() {
         // drive the hook callback directly (SendInput itself is denied on a locked desktop)
+        InputRouter.SetVoiceDriverRunning(false);
         InputRouter.SetMappingEnabled(false);
         InputRouter.SetBlockF5(true);
         InputRouter.SetLinked(true);
@@ -361,6 +363,50 @@ static class SelfTest {
         InputRouter.SetLinked(false);
         Check(InputRouter.TestDispatch(0x83, true) != (IntPtr)1, "voice: F20 follows existing disconnected passthrough behavior");
         InputRouter.SetLinked(true);
+    }
+
+    static void TestDriverF5Passthrough() {
+        InputRouter.SetMappingEnabled(false);
+        InputRouter.SetBlockF5(true);
+        InputRouter.SetLinked(true);
+        InputRouter.SetVoiceDriverRunning(true);
+        try {
+            long before = InputRouter.SwallowedVoiceKeyCount;
+            Check(InputRouter.TestDispatch(0x74, true, false) != (IntPtr)1,
+                "driver: physical F5 down passes while remote is connected");
+            Check(InputRouter.TestDispatch(0x74, true, false) != (IntPtr)1 &&
+                  InputRouter.TestDispatch(0x74, false, false) != (IntPtr)1 &&
+                  InputRouter.SwallowedVoiceKeyCount == before,
+                "driver: physical F5 repeats and release pass without counting as voice");
+            Check(InputRouter.TestDispatch(0x83, true) == (IntPtr)1 &&
+                  InputRouter.TestDispatch(0x83, true) == (IntPtr)1 &&
+                  InputRouter.TestDispatch(0x83, false) == (IntPtr)1,
+                "driver: remote F20 press, repeats and release stay blocked");
+            ushort[] cleanup = InputRouter.VoiceKeysToRelease();
+            Check(cleanup.Length == 1 && cleanup[0] == 0x83,
+                "driver: voice preparation never releases physical F5");
+            var map = new KeyMapConfig();
+            map.enabled = true;
+            map.Find("voice").click.kind = "combo";
+            map.Find("voice").click.keys = "LCTRL+A";
+            InputRouter.SetKeyMap(map);
+            RawSink.SeedEvidence(0, -1);
+            Check(InputRouter.TestDispatch(0x74, true, false) != (IntPtr)1 &&
+                  InputRouter.TestDispatch(0x74, false, false) != (IntPtr)1,
+                "driver: legacy voice F5 mapping cannot capture physical keyboard F5");
+            InputRouter.SetMappingEnabled(false);
+            InputRouter.SetVoiceDriverRunning(false);
+            Check(InputRouter.TestDispatch(0x74, true) == (IntPtr)1 &&
+                  InputRouter.TestDispatch(0x74, false) == (IntPtr)1,
+                "driver: unloading filter restores legacy remote F5 blocking");
+            cleanup = InputRouter.VoiceKeysToRelease();
+            Check(Array.IndexOf(cleanup, (ushort)0x74) >= 0 && Array.IndexOf(cleanup, (ushort)0x83) >= 0,
+                "driver: driverless voice preparation keeps legacy cleanup");
+        } finally {
+            InputRouter.SetVoiceDriverRunning(false);
+            InputRouter.SetKeyMap(new KeyMapConfig());
+            RawSink.SeedEvidence(-1, -1);
+        }
     }
 
     static void TestKeyMap() {

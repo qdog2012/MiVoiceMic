@@ -56,7 +56,7 @@ class Config {
     public StatsConfig stats = new StatsConfig();
 
     // keyboard
-    public bool blockF5 = true;           // swallow voice F5 or driver F20 while linked (keep saved key name)
+    public bool blockF5 = true;           // F20 only when driver runs; otherwise legacy F5/F20 (saved key unchanged)
 
     // misc
     public bool dumpAudio = false;        // save each voice session to wav (next to the exe)
