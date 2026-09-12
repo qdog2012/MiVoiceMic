@@ -1,0 +1,66 @@
+name: Publish Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Compile Windows x64 application
+        run: |
+          & .\build.bat
+          if ($LASTEXITCODE -ne 0) { throw 'Application build failed' }
+
+      - name: Verify application and signed driver package
+        run: |
+          & .\MiVoiceMic.exe --selftest | Tee-Object -Variable results
+          if ($LASTEXITCODE -ne 0 -or ($results -join "`n") -notmatch '== \d+ passed, 0 failed ==') {
+            throw 'Application self-tests failed or did not finish'
+          }
+          & .\tools\test-driver-package.ps1
+
+      - name: Prepare downloadable files
+        run: |
+          & .\tools\package-release.ps1 -Version $env:GITHUB_REF_NAME
+
+      - name: Publish release and attachments
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $notes = Join-Path 'docs\releases' ($tag + '.md')
+          if (-not (Test-Path -LiteralPath $notes)) { throw "Missing release notes: $notes" }
+          $assets = @(Get-ChildItem -LiteralPath (Join-Path 'artifacts\release' $tag) -File | ForEach-Object FullName)
+          $releaseJson = & gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect existing releases' }
+          $allReleases = $releaseJson | ConvertFrom-Json
+          $existing = @($allReleases | Where-Object tag_name -eq $tag)
+          if ($existing.Count -eq 0) {
+            & gh release create $tag --repo $env:GITHUB_REPOSITORY --verify-tag --draft --title "MiVoiceMic $tag" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the release draft' }
+          } elseif (-not $existing[0].draft) {
+            throw 'This release is already published; refusing to overwrite its files'
+          }
+          & gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not upload all release attachments' }
+          & gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the completed release' }

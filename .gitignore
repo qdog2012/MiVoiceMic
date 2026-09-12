@@ -1,6 +1,7 @@
 # build artifacts
 MiVoiceMic.exe
 MiVoiceMic.new.exe
+/artifacts/
 
 # runtime artifacts
 MiVoiceMic.log

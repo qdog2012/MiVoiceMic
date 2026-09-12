@@ -8,6 +8,10 @@
 
 参考并致敬 macOS 端 [HD838A/remote-mic-app](https://github.com/HD838A/remote-mic-app)（原版应用，本项目界面与交互的参考）与 Windows 端 [QL-4/RemoteMapper](https://github.com/QL-4/RemoteMapper)（ATVV 协议逆向与内核驱动来源，许可证同为 GPL-3.0）。
 
+## 下载
+
+从 [GitHub Releases](https://github.com/qdog2012/MiVoiceMic/releases/latest) 下载已编译的程序。首次使用推荐完整的 `win-x64.zip` 压缩包，解压后运行 `MiVoiceMic.exe`；只更新主程序时也可单独下载 EXE。发布包包含驱动安装脚本和说明，不包含个人配置或运行日志。
+
 ## 功能特性
 
 - **语音输入**：按住遥控器语音键 → ATVV 协议经 BLE 推流 → IMA ADPCM 解码（16 kHz）→ 虚拟声卡（VB-CABLE）→ 自动切换默认麦克风 → 注入输入法语音热键 → 松开上屏
