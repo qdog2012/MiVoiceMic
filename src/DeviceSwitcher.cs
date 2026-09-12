@@ -126,18 +126,31 @@ sealed class DeviceSwitcher {
     public bool TargetFound { get { return targetId != null; } }
 
     /// Switch default capture to the target (call on voice-key press, before hotkey).
-    public void SwitchToTarget() {
-        if (targetId == null) return;
+    public bool SwitchToTarget() {
+        if (targetId == null) return false;
+        bool changed = false;
         try {
             RunSta(delegate {
                 var e = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_MMDeviceEnumerator));
                 IMMDevice d; e.GetDefaultAudioEndpoint(EDataFlow.eCapture, ERole.eConsole, out d);
                 string id; d.GetId(out id);
+                // Do not notify every audio app of a device change when all
+                // default roles already point to the cable (common with WeType).
+                bool alreadyTarget = id == targetId;
+                for (int role = 1; role <= 2; role++) {
+                    IMMDevice other;
+                    e.GetDefaultAudioEndpoint(EDataFlow.eCapture, (ERole)role, out other);
+                    string otherId; other.GetId(out otherId);
+                    alreadyTarget &= otherId == targetId;
+                }
+                if (alreadyTarget) return;
                 savedDefault = id;
                 SetDefault(targetId);
+                changed = true;
             });
-            Log.Info("[DEV] default capture -> cable");
+            Log.Info(changed ? "[DEV] default capture -> cable" : "[DEV] 默认麦克风已是 CABLE，跳过切换和等待");
         } catch (Exception ex) { Log.Error("[DEV] switch failed: " + ex.Message); }
+        return changed;
     }
 
     /// Restore the previous default (call on voice-key release, after hotkey).

@@ -62,10 +62,15 @@ sealed class BleVoiceLink {
     readonly Config cfg;
     readonly IHandler handler;
     CancellationTokenSource cts;
+    readonly object restartGate = new object();
+    readonly SemaphoreSlim lifecycleGate = new SemaphoreSlim(1, 1);
+    volatile bool stopped;
+    CancellationToken connectionToken;
 
     BluetoothLEDevice device;
     GattDeviceService svcAtvv, svcBattery;
-    GattCharacteristic chCmd, chAud, chCtl;
+    GattCharacteristic chCmd, chAud, chCtl, chCharge;
+    GattSession gattSession;
     readonly SemaphoreSlim writeGate = new SemaphoreSlim(1, 1);
 
     volatile bool linked;
@@ -90,35 +95,63 @@ sealed class BleVoiceLink {
     }
 
     public void Start() {
-        if (cts != null) return;
-        cts = new CancellationTokenSource();
-        Task.Run((Action)delegate { LinkLoop(cts.Token); });
+        QueueConnection(null);
     }
 
     public void Stop() {
-        try { if (cts != null) cts.Cancel(); } catch { }
-        if (keepalive != null) { try { keepalive.Dispose(); } catch { } keepalive = null; }
-        Cleanup();
+        lock (restartGate) {
+            stopped = true;
+            if (cts != null) cts.Cancel();
+            if (keepalive != null) { keepalive.Dispose(); keepalive = null; }
+        }
+        handler.OnVoiceStop();
+        Task.Run(async delegate {
+            await lifecycleGate.WaitAsync();
+            try { Cleanup(); }
+            catch (Exception ex) { Log.Warn("[BLE] stop: " + ex.Message); }
+            finally { lifecycleGate.Release(); }
+        });
     }
 
     /// Manual reconnect from the tray.
-    public void Reconnect() {
-        try { if (cts != null) cts.Cancel(); } catch { }
-        Cleanup();
-        if (keepalive != null) { try { keepalive.Dispose(); } catch { } keepalive = null; }
-        cts = new CancellationTokenSource();
-        CancellationToken token = cts.Token;
-        Task.Run((Action)delegate { LinkLoop(token); });
+    public void Reconnect() { QueueConnection(null); }
+
+    void QueueConnection(CancellationToken? expected) {
+        lock (restartGate) {
+            if (stopped || (expected.HasValue && (cts == null || cts.Token != expected.Value))) return;
+            if (cts != null) cts.Cancel();
+            if (keepalive != null) { keepalive.Dispose(); keepalive = null; }
+            var source = new CancellationTokenSource();
+            cts = source;
+            CancellationToken token = source.Token;
+            linked = false;
+            InputRouter.SetLinked(false);
+            handler.OnVoiceStop();
+            handler.OnLinkState(false, "正在重新连接遥控器...");
+            Task.Run(async delegate {
+                bool entered = false;
+                try {
+                    await lifecycleGate.WaitAsync(token);
+                    entered = true;
+                    token.ThrowIfCancellationRequested();
+                    Cleanup();
+                    await LinkLoop(token);
+                } catch (OperationCanceledException) { }
+                catch (Exception ex) { Log.Warn("[BLE] connection worker: " + ex.Message); }
+                finally { if (entered) lifecycleGate.Release(); }
+            });
+        }
     }
 
     // ======================= link loop =======================
 
-    async void LinkLoop(CancellationToken token) {
+    async Task LinkLoop(CancellationToken token) {
         int failures = 0;
         while (!token.IsCancellationRequested) {
             bool failed = false;
             string error = null;
             try {
+                Log.Info("[BLE] 正在查找已配对遥控器");
                 var di = await FindPairedRemote(token);
                 if (di == null && cfg.autoPair) di = await TryFindAndPairAdvertising(token);
                 if (di == null) {
@@ -129,24 +162,29 @@ sealed class BleVoiceLink {
                 Log.Info("[BLE] connecting: " + di.Name + " (" + di.Id + ")");
                 handler.OnLinkState(false, "正在连接 " + di.Name + " ...");
 
-                var dev = await AsT(BluetoothLEDevice.FromIdAsync(di.Id));
+                var dev = await AsT(BluetoothLEDevice.FromIdAsync(di.Id), token);
                 if (dev == null) throw new Exception("FromIdAsync returned null");
                 device = dev;
                 RemoteName = string.IsNullOrEmpty(dev.Name) ? di.Name : dev.Name;
 
                 dev.ConnectionStatusChanged += OnConnectionChanged;   // works with System.Runtime.InteropServices.WindowsRuntime referenced
-                TryMaintainConnection(dev);
+                await TryMaintainConnection(dev, token);
 
                 await SetupGatt(token);
                 await Handshake(token);
+                token.ThrowIfCancellationRequested();
 
                 linked = true;
                 micOpen = true;   // MIC_OPEN sent; remote signals sessions via CTL
                 handler.OnLinkState(true, RemoteName);
-                TryReadBattery();
                 failures = 0;
 
-                keepalive = new Timer(KeepaliveTick, null, 5000, 5000);
+                keepTicks = 0;
+                lock (restartGate) {
+                    token.ThrowIfCancellationRequested();
+                    keepalive = new Timer(KeepaliveTick, token, 5000, 5000);
+                }
+                await TryReadBattery(token);
                 return;   // supervision continues via events
             } catch (Exception ex) {
                 failed = true;
@@ -163,50 +201,49 @@ sealed class BleVoiceLink {
     }
 
     async void KeepaliveTick(object state) {
+        CancellationToken token = (CancellationToken)state;
+        if (token.IsCancellationRequested || !await lifecycleGate.WaitAsync(0)) return;
+        bool reconnect = false;
         try {
+            token.ThrowIfCancellationRequested();
             if (micOpen && version >= 0x0100)
-                await WriteCmd(new byte[] { 0x0E, sessionId });   // MIC_EXTEND
+                await WriteCmd(new byte[] { 0x0E, sessionId }, token);   // MIC_EXTEND
+            if (++keepTicks % 12 == 0) await TryReadBattery(token);
+        } catch (OperationCanceledException) {
         } catch (Exception ex) {
             Log.Warn("[ATVV] keepalive failed: " + ex.Message + " -> reconnect");
-            ScheduleReconnect();
-            return;
-        }
-        if (++keepTicks % 12 == 0) TryReadBattery();   // 12 x 5s: refresh battery/charging each minute
-    }
-
-    void ScheduleReconnect() {
-        var t = new Thread((ThreadStart)delegate {
-            try { Thread.Sleep(500); } catch { }
-            try { Reconnect(); } catch { }
-        }) { IsBackground = true };
-        t.Start();
+            reconnect = true;
+        } finally { lifecycleGate.Release(); }
+        if (reconnect) QueueConnection(token);
     }
 
     void OnConnectionChanged(BluetoothLEDevice sender, object args) {
-        if (sender.ConnectionStatus == BluetoothConnectionStatus.Disconnected && linked) {
+        if (sender == device && sender.ConnectionStatus == BluetoothConnectionStatus.Disconnected && linked) {
             Log.Warn("[BLE] disconnected unexpectedly -> reconnect");
             linked = false;
             micOpen = false;
             InputRouter.SetLinked(false);
             handler.OnVoiceStop();          // release hotkey / restore mic
             handler.OnLinkState(false, "连接断开，正在重连...");
-            ScheduleReconnect();
+            var source = cts;
+            if (source != null) QueueConnection(source.Token);
         }
     }
 
-    void TryMaintainConnection(BluetoothLEDevice dev) {
+    async Task TryMaintainConnection(BluetoothLEDevice dev, CancellationToken token) {
         try {
-            var session = AsT(GattSession.FromDeviceIdAsync(dev.BluetoothDeviceId)).GetAwaiter().GetResult();
-            if (session != null) session.MaintainConnection = true;
+            gattSession = await AsT(GattSession.FromDeviceIdAsync(dev.BluetoothDeviceId), token);
+            if (gattSession != null) gattSession.MaintainConnection = true;
             Log.Info("[BLE] GattSession.MaintainConnection = true");
-        } catch (Exception ex) {
+        } catch (OperationCanceledException) { throw; }
+        catch (Exception ex) {
             Log.Info("[BLE] MaintainConnection unavailable: " + ex.Message);
         }
     }
 
     async Task<DeviceInformation> FindPairedRemote(CancellationToken token) {
         var sel = BluetoothLEDevice.GetDeviceSelector();
-        var devs = await AsT(DeviceInformation.FindAllAsync(sel));
+        var devs = await AsT(DeviceInformation.FindAllAsync(sel), token);
         if (devs == null) return null;
         foreach (var d in devs) {
             if (IsRemoteName(d.Name)) return d;
@@ -305,11 +342,12 @@ sealed class BleVoiceLink {
         GattCharacteristic cmd = null, aud = null, ctl = null;
         GattDeviceService svc = null;
         for (int attempt = 0; attempt < 5; attempt++) {
-            var svcRes = await AsT(device.GetGattServicesAsync(BluetoothCacheMode.Uncached));
+            var svcRes = await AsT(device.GetGattServicesAsync(BluetoothCacheMode.Uncached), token);
+            Log.Info("[GATT] services: " + (svcRes == null ? "no result" : svcRes.Status + ", count=" + svcRes.Services.Count));
             if (svcRes != null) {
                 svc = svcRes.Services.FirstOrDefault(s => s.Uuid == SVC);
                 if (svc != null) {
-                    var chRes = await AsT(svc.GetCharacteristicsAsync(BluetoothCacheMode.Uncached));
+                    var chRes = await AsT(svc.GetCharacteristicsAsync(BluetoothCacheMode.Uncached), token);
                     if (chRes != null) {
                         cmd = chRes.Characteristics.FirstOrDefault(c => c.Uuid == C_CMD);
                         aud = chRes.Characteristics.FirstOrDefault(c => c.Uuid == C_AUD);
@@ -322,48 +360,50 @@ sealed class BleVoiceLink {
             await Delay(1.0, token);
         }
         if (cmd == null || aud == null || ctl == null)
-            throw new Exception("ATVV 服务未找到 (设备可能未正确配对，或不是小米蓝牙语音遥控器)");
+            throw new Exception("遥控器语音服务不可用，请按遥控器任意键唤醒；持续失败时重新配对");
 
+        connectionToken = token;
         svcAtvv = svc; chCmd = cmd; this.chAud = aud; this.chCtl = ctl;
         HookValueChanged(ctl, CtlHandler);
         HookValueChanged(aud, AudioHandler);
-        var r1 = await AsT(ctl.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify));
-        var r2 = await AsT(aud.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify));
+        var r1 = await AsT(ctl.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify), token);
+        var r2 = await AsT(aud.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify), token);
         if (r1 != GattCommunicationStatus.Success || r2 != GattCommunicationStatus.Success)
             throw new Exception("订阅 ATVV 通知失败: ctl=" + r1 + " aud=" + r2);
     }
 
     async Task Handshake(CancellationToken token) {
         // GET_CAPS v1.0 (both known remotes speak this)
-        await WriteCmd(new byte[] { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 });
-        var capsWait = new TaskCompletionSource<bool>();
+        var capsWait = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         capsPending = capsWait;
         capsError = null;
-        var done = await Task.WhenAny(capsWait.Task, Task.Delay(4000, token));
-        capsPending = null;
-        if (done != capsWait.Task)
-            throw new Exception("CAPS 无响应 (遥控器未应答，尝试按任意键唤醒后重启应用)");
-        if (!capsWait.Task.Result)
-            throw new Exception(string.IsNullOrEmpty(capsError) ? "CAPS 拒绝" : capsError);
+        try {
+            // Register the waiter BEFORE sending: a fast response can arrive during the write.
+            await WriteCmd(new byte[] { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 }, token);
+            if (!await AsyncDeadline.Wait(capsWait.Task, token, 4000, null))
+                throw new Exception(string.IsNullOrEmpty(capsError) ? "CAPS 拒绝" : capsError);
+        } finally { if (capsPending == capsWait) capsPending = null; }
 
         // MIC_OPEN (version-aware; codec from CAPS)
-        if (version >= 0x0100) await WriteCmd(new byte[] { 0x0C, 0x00 });
-        else await WriteCmd(new byte[] { 0x0C, 0x00, (byte)codec });
+        if (version >= 0x0100) await WriteCmd(new byte[] { 0x0C, 0x00 }, token);
+        else await WriteCmd(new byte[] { 0x0C, 0x00, (byte)codec }, token);
     }
 
     TaskCompletionSource<bool> capsPending;
     string capsError;
 
-    async void TryReadBattery() {
+    async Task TryReadBattery(CancellationToken token) {
         try {
-            var svcRes = await AsT(device.GetGattServicesAsync(BluetoothCacheMode.Cached));
-            var bsvc = svcRes.Services.FirstOrDefault(s => s.Uuid == SVC_BATTERY);
+            if (svcBattery == null) {
+                var svcRes = await AsT(device.GetGattServicesAsync(BluetoothCacheMode.Cached), token);
+                svcBattery = svcRes.Services.FirstOrDefault(s => s.Uuid == SVC_BATTERY);
+            }
+            var bsvc = svcBattery;
             if (bsvc == null) return;
-            svcBattery = bsvc;
-            var chRes = await AsT(bsvc.GetCharacteristicsAsync(BluetoothCacheMode.Cached));
+            var chRes = await AsT(bsvc.GetCharacteristicsAsync(BluetoothCacheMode.Cached), token);
             var bc = chRes.Characteristics.FirstOrDefault(c => c.Uuid == CHR_BATTERY);
             if (bc != null) {
-                var read = await AsT(bc.ReadValueAsync());
+                var read = await AsT(bc.ReadValueAsync(), token);
                 if (read.Status == GattCommunicationStatus.Success && read.Value.Length >= 1) {
                     var b = ToBytes(read.Value);
                     Battery = b[0];
@@ -372,7 +412,7 @@ sealed class BleVoiceLink {
             }
             var cc = chRes.Characteristics.FirstOrDefault(c => c.Uuid == CHR_BATT_STATUS);
             if (cc == null) return;               // RC001-style: no charging info
-            var cs = await AsT(cc.ReadValueAsync());
+            var cs = await AsT(cc.ReadValueAsync(), token);
             if (cs.Status == GattCommunicationStatus.Success) {
                 var b = ToBytes(cs.Value);
                 int st = ParseChargeState(b);
@@ -384,23 +424,27 @@ sealed class BleVoiceLink {
                 chargeHooked = true;              // slow/hung CCCD write can't delay it
                 try {
                     if ((cc.CharacteristicProperties & GattCharacteristicProperties.Notify) != 0) {
+                        chCharge = cc;
                         HookValueChanged(cc, ChargeHandler);
                         var sub = await AsT(cc.WriteClientCharacteristicConfigurationDescriptorAsync(
-                            GattClientCharacteristicConfigurationDescriptorValue.Notify));
+                            GattClientCharacteristicConfigurationDescriptorValue.Notify), token);
                         Log.Info("[BAT] 2BED notify subscribed: " + sub);
                     } else {
                         Log.Info("[BAT] 2BED has no notify property - polling every 60s");
                     }
                 } catch (Exception ex) { Log.Warn("[BAT] 2BED subscribe: " + ex.Message); }
             }
-        } catch (Exception ex) { Log.Warn("[BAT] read: " + ex.Message); }
+        } catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { Log.Warn("[BAT] read: " + ex.Message); }
     }
 
     void ChargeHandler(GattCharacteristic sender, GattValueChangedEventArgs e) {
+        if (sender != chCharge || stopped || connectionToken.IsCancellationRequested) return;
         try {
             byte[] b = ToBytes(e.CharacteristicValue);
             Log.Info("[BAT] 2BED notify: " + HexStr(b) + " -> " + ChargeText(ParseChargeState(b)));
-            TryReadBattery();            // refresh % alongside the charge-state change
+            Charging = ParseChargeState(b);
+            handler.OnCharging(Charging);
         } catch { }
     }
 
@@ -427,6 +471,7 @@ sealed class BleVoiceLink {
     // ======================= notification handlers =======================
 
     void CtlHandler(GattCharacteristic sender, GattValueChangedEventArgs e) {
+        if (sender != chCtl || stopped || connectionToken.IsCancellationRequested) return;
         byte[] b = ToBytes(e.CharacteristicValue);
         if (b.Length < 1) return;
         byte op = b[0];
@@ -484,6 +529,7 @@ sealed class BleVoiceLink {
     }
 
     void AudioHandler(GattCharacteristic sender, GattValueChangedEventArgs e) {
+        if (sender != chAud || stopped || connectionToken.IsCancellationRequested) return;
         try {
             byte[] b = ToBytes(e.CharacteristicValue);
             if (b.Length > 0) handler.OnAudioFrame(b);
@@ -493,20 +539,31 @@ sealed class BleVoiceLink {
     }
 
     async void WriteCmdSafe(byte[] data) {
-        try { await WriteCmd(data); } catch (Exception ex) { Log.Warn("[ATVV] write: " + ex.Message); }
+        var source = cts;
+        if (source == null) return;
+        bool entered = false;
+        try {
+            await lifecycleGate.WaitAsync(source.Token);
+            entered = true;
+            await WriteCmd(data, source.Token);
+            micOpen = true;
+        } catch (OperationCanceledException) { }
+        catch (Exception ex) { Log.Warn("[ATVV] write: " + ex.Message); QueueConnection(source.Token); }
+        finally { if (entered) lifecycleGate.Release(); }
     }
 
-    async Task WriteCmd(byte[] data) {
+    async Task WriteCmd(byte[] data, CancellationToken token) {
         if (chCmd == null) throw new Exception("not connected");
-        await writeGate.WaitAsync();
+        await writeGate.WaitAsync(token);
         try {
+            token.ThrowIfCancellationRequested();
             var w = new DataWriter();
             w.WriteBytes(data);
-            var res = await AsT(chCmd.WriteValueAsync(w.DetachBuffer(), GattWriteOption.WriteWithoutResponse));
+            var res = await AsT(chCmd.WriteValueAsync(w.DetachBuffer(), GattWriteOption.WriteWithoutResponse), token);
             if (res != GattCommunicationStatus.Success) {
                 var w2 = new DataWriter();
                 w2.WriteBytes(data);
-                res = await AsT(chCmd.WriteValueAsync(w2.DetachBuffer()));
+                res = await AsT(chCmd.WriteValueAsync(w2.DetachBuffer()), token);
                 if (res != GattCommunicationStatus.Success)
                     throw new Exception("write failed: " + res);
             }
@@ -519,18 +576,43 @@ sealed class BleVoiceLink {
         mi.Invoke(ch, new object[] { handler });
     }
 
+    void UnhookValueChanged(GattCharacteristic ch, TypedEventHandler<GattCharacteristic, GattValueChangedEventArgs> handler) {
+        if (ch == null) return;
+        try {
+            var mi = ch.GetType().GetMethod("remove_ValueChanged", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            mi.Invoke(ch, new object[] { handler });
+        } catch { }
+    }
+
     void Cleanup() {
+        long started = VoiceSessionGuard.NowMs;
+        Log.Info("[BLE] cleanup begin");
         linked = false;
         micOpen = false;
         chargeHooked = false;
         InputRouter.SetLinked(false);
+        handler.OnVoiceStop();
+        capsPending = null;
+        UnhookValueChanged(chCtl, CtlHandler);
+        UnhookValueChanged(chAud, AudioHandler);
+        UnhookValueChanged(chCharge, ChargeHandler);
         if (device != null) {
             try { device.ConnectionStatusChanged -= OnConnectionChanged; } catch { }
         }
-        if (svcAtvv != null) { try { svcAtvv.Dispose(); } catch { } svcAtvv = null; }
-        if (svcBattery != null) { try { svcBattery.Dispose(); } catch { } svcBattery = null; }
-        chCmd = null; chAud = null; chCtl = null;
-        if (device != null) { try { device.Dispose(); } catch { } device = null; }
+        if (svcAtvv != null) { ReleaseGatt("ATVV service", svcAtvv.Dispose); svcAtvv = null; }
+        if (svcBattery != null) { ReleaseGatt("battery service", svcBattery.Dispose); svcBattery = null; }
+        chCmd = null; chAud = null; chCtl = null; chCharge = null;
+        if (gattSession != null) { ReleaseGatt("GattSession", gattSession.Dispose); gattSession = null; }
+        if (device != null) { ReleaseGatt("BluetoothLEDevice", device.Dispose); device = null; }
+        Log.Info("[BLE] cleanup complete: " + (VoiceSessionGuard.NowMs - started) + " ms");
+    }
+
+    static void ReleaseGatt(string name, Action release) {
+        long started = VoiceSessionGuard.NowMs;
+        Log.Info("[BLE] releasing " + name);
+        try { release(); }
+        catch (Exception ex) { Log.Warn("[BLE] release " + name + ": " + ex.Message); }
+        finally { Log.Info("[BLE] released " + name + ": " + (VoiceSessionGuard.NowMs - started) + " ms"); }
     }
 
     static Task Delay(double seconds, CancellationToken token) {
@@ -553,6 +635,10 @@ sealed class BleVoiceLink {
     public static string GetDefaultRadioInfo() {
         var adapter = AsT(Windows.Devices.Bluetooth.BluetoothAdapter.GetDefaultAsync()).GetAwaiter().GetResult();
         if (adapter == null) throw new Exception("未检测到蓝牙适配器");
+        if (!adapter.IsLowEnergySupported) throw new Exception("蓝牙适配器不支持 BLE");
+        var radio = AsT(adapter.GetRadioAsync()).GetAwaiter().GetResult();
+        if (radio == null || radio.State != Windows.Devices.Radios.RadioState.On)
+            throw new Exception("蓝牙未开启或无线电不可用，请在 Windows 蓝牙设置中开启（" + (radio == null ? "未知" : radio.State.ToString()) + "）");
         ulong a = adapter.BluetoothAddress;
         return string.Format("适配器正常 ({0:X2}:{1:X2}:{2:X2}:{3:X2}:{4:X2}:{5:X2})",
             (a >> 40) & 0xFF, (a >> 32) & 0xFF, (a >> 24) & 0xFF, (a >> 16) & 0xFF, (a >> 8) & 0xFF, a & 0xFF);
@@ -581,8 +667,10 @@ sealed class BleVoiceLink {
         }
     }
 
-    internal static Task<T> AsT<T>(IAsyncOperation<T> op) {
-        var tcs = new TaskCompletionSource<T>();
+    internal static Task<T> AsT<T>(IAsyncOperation<T> op, CancellationToken token = default(CancellationToken)) {
+        // Never run the next GATT call inside a native completion callback.
+        // Some Bluetooth drivers hold internal locks until that callback returns.
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         op.Completed = delegate (IAsyncOperation<T> o, AsyncStatus s) {
             try {
                 if (s == AsyncStatus.Completed) tcs.TrySetResult(o.GetResults());
@@ -590,7 +678,7 @@ sealed class BleVoiceLink {
                 else tcs.TrySetCanceled();
             } catch (Exception ex) { tcs.TrySetException(ex); }
         };
-        return tcs.Task;
+        return AsyncDeadline.Wait(tcs.Task, token, 10000, delegate { try { op.Cancel(); } catch { } });
     }
 
     internal static byte[] ToBytes(IBuffer buf) {

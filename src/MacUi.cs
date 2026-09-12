@@ -542,6 +542,7 @@ class ComboCaptureBox : MacWidget {
     /// True while waiting for the user to press the combo.
     public bool Capturing { get { return armed; } }
     readonly List<ushort> held = new List<ushort>();
+    readonly List<ushort> captured = new List<ushort>();
 
     public ComboCaptureBox(string initial) {
         Value = initial ?? "";
@@ -565,6 +566,7 @@ class ComboCaptureBox : MacWidget {
         Focus();
         armed = true;                                        // capture starts on CLICK only
         held.Clear();
+        captured.Clear();
         InvalidateSafe();
     }
 
@@ -572,6 +574,7 @@ class ComboCaptureBox : MacWidget {
         base.OnLostFocus(e);
         armed = false;
         held.Clear();
+        captured.Clear();
         InvalidateSafe();
     }
 
@@ -588,30 +591,38 @@ class ComboCaptureBox : MacWidget {
         if (e.KeyCode == Keys.Escape) {                      // Esc = cancel this capture
             armed = false;
             held.Clear();
+            captured.Clear();
             InvalidateSafe();
             return;
         }
         ushort vk = (ushort)e.KeyValue;
         if (vk == 0) return;
+        if (vk == 0x10) vk = 0xA0;
+        if (vk == 0x11) vk = 0xA2;
+        if (vk == 0x12) vk = 0xA4;
         if (IsModifier(vk)) {
             // track only the raw left/right codes for display; generic
             // Shift/Ctrl/Alt codes are already covered by e.Modifiers below
             if (vk >= 0xA0 || vk == 0x5B || vk == 0x5C) {
                 if (!held.Contains(vk)) held.Add(vk);
+                if (!captured.Contains(vk)) captured.Add(vk);
             }
             InvalidateSafe();
             return;
         }
+        // Ignore IME/driver placeholders such as VK_NONAME (0xFC).
+        if (!VkNames.IsSupported(vk)) return;
         var combo = new List<ushort>();
         if ((e.Modifiers & Keys.Control) != 0) combo.Add(0xA2);
         if ((e.Modifiers & Keys.Shift) != 0) combo.Add(0xA0);
         if ((e.Modifiers & Keys.Alt) != 0) combo.Add(0xA4);
-        if ((e.Modifiers & Keys.LWin) != 0 || (e.Modifiers & Keys.RWin) != 0) combo.Add(0x5B);
+        // LWin/RWin are key codes, NOT modifier flags; use the tracked keys.
         foreach (ushort m in held) if (!combo.Contains(m)) combo.Add(m);
         combo.Add(vk);
         Value = KeyMapNames.FormatCombo(combo.ToArray());
         armed = false;
         held.Clear();
+        captured.Clear();
         InvalidateSafe();
         if (ValueChanged != null) ValueChanged();
     }
@@ -620,7 +631,18 @@ class ComboCaptureBox : MacWidget {
         base.OnKeyUp(e);
         if (!armed) return;
         e.Handled = true;
-        held.Remove((ushort)e.KeyValue);
+        ushort vk = (ushort)e.KeyValue;
+        if (vk == 0x10) vk = 0xA0;
+        if (vk == 0x11) vk = 0xA2;
+        if (vk == 0x12) vk = 0xA4;
+        held.Remove(vk);
+        // Modifier-only shortcuts (Ctrl+Win) finish when the first modifier is released.
+        if (IsModifier(vk) && captured.Count > 0) {
+            Value = KeyMapNames.FormatCombo(captured.ToArray());
+            armed = false;
+            held.Clear(); captured.Clear();
+            if (ValueChanged != null) ValueChanged();
+        }
         InvalidateSafe();
     }
 

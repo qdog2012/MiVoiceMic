@@ -1,9 +1,10 @@
 // SelfTest.cs - offline logic tests (run with: MiVoiceMic.exe --selftest)
-// 中文：离线单元测试 —— 解码/配置/手势引擎/钩子判定/充电状态解析/按键归因（45 项）
+// 中文：离线单元测试 —— 解码/配置/手势/按键归因/会话恢复/蓝牙超时/快捷键捕获
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 
 static class SelfTest {
     static int passed, failed;
@@ -27,8 +28,154 @@ static class SelfTest {
         TestChargeState();
         TestLooksFromRemote();
         TestDeferredAttribution();
+        TestVoiceRecovery();
+        TestVoiceKeyOwnership();
+        TestBluetoothDeadlines();
+        TestHotkeyValidation();
+        TestComboCapture();
         Console.WriteLine("== " + passed + " passed, " + failed + " failed ==");
         return failed == 0 ? 0 : 1;
+    }
+
+    static void TestVoiceRecovery() {
+        var guard = new VoiceSessionGuard();
+        Check(guard.TimeoutReason(999999) == null, "voice: idle does not reconnect");
+        guard.Start(6, 1000);
+        long generation = guard.Generation;
+        Check(guard.TimeoutReason(4999) == null, "voice: allow startup latency");
+        Check(guard.TimeoutReason(5000) != null, "voice: no audio after START recovers");
+        guard.Audio(2000);
+        Check(guard.TimeoutReason(4499) == null, "voice: short packet gap tolerated");
+        Check(guard.TimeoutReason(4500) != null, "voice: missing STOP with stalled audio recovers");
+        Check(guard.IsDuplicate(6), "voice: duplicate START detected without resetting deadline");
+        guard.Stop();
+        Check(!guard.IsCurrent(generation) && guard.TimeoutReason(9000) == null, "voice: STOP cancels queued press and watchdog");
+        guard.Start(7, 10000);
+        Check(!guard.IsCurrent(generation), "voice: old audio/press cannot enter next session");
+        for (int ms = 11000; ms <= 309000; ms += 1000) guard.Audio(ms);
+        Check(guard.TimeoutReason(309000) == null, "voice: continuous audio survives ordinary pauses in speech");
+        guard.Audio(310000);
+        Check(guard.TimeoutReason(310000) != null, "voice: hard limit ends endless audio without STOP");
+    }
+
+    sealed class FakeVoiceHotkey : IVoiceHotkey {
+        public int Down, Up, Released;
+        public bool FailDown, FailUp;
+        public Action Prepare;
+        public void PrepareVoiceDown() { if (Prepare != null) Prepare(); }
+        public void OnVoiceDown() { Down++; if (FailDown) throw new Exception("partial press"); }
+        public void OnVoiceUp() { Up++; if (FailUp) throw new Exception("release failed"); }
+        public void ForceRelease() { Released++; }
+    }
+
+    static void TestVoiceKeyOwnership() {
+        int restores = 0;
+        var lease = new VoiceKeySession(delegate { restores++; });
+        var oldKeys = new FakeVoiceHotkey();
+        var newKeys = new FakeVoiceHotkey();
+        lease.Begin(oldKeys, delegate { }, delegate { return true; });
+        lease.Begin(newKeys, null, delegate { return true; });
+        Check(oldKeys.Down == 1 && oldKeys.Up == 1 && oldKeys.Released == 1 && restores == 1,
+            "voice: changing combo releases original keys and restores mic");
+        lease.End(); lease.End();
+        Check(newKeys.Up == 1 && newKeys.Released == 1, "voice: duplicate STOP does not toggle IME twice");
+        var cancelled = new FakeVoiceHotkey();
+        lease.Begin(cancelled, delegate { restores += 100; }, delegate { return false; });
+        Check(cancelled.Down == 0 && restores == 1, "voice: fast release cancels queued key press");
+        bool current = true;
+        lease.Begin(cancelled, delegate { current = false; }, delegate { return current; });
+        Check(cancelled.Down == 0 && restores == 2, "voice: STOP during mic delay restores without injecting");
+        var broken = new FakeVoiceHotkey { FailDown = true };
+        try { lease.Begin(broken, delegate { }, delegate { return true; }); } catch { }
+        Check(broken.Released == 1 && restores == 3, "voice: partial key press failure still releases and restores");
+        broken = new FakeVoiceHotkey { FailUp = true };
+        lease.Begin(broken, delegate { }, delegate { return true; });
+        try { lease.End(); } catch { }
+        Check(broken.Released == 1 && restores == 4, "voice: release failure still forces key up and restores mic");
+        lease.Begin(null, delegate { }, delegate { return true; });
+        lease.End();
+        Check(restores == 5, "voice: disabled injection still restores audio-only session");
+        current = true;
+        var stoppedDuringPrepare = new FakeVoiceHotkey { Prepare = delegate { current = false; } };
+        lease.Begin(stoppedDuringPrepare, delegate { }, delegate { return current; });
+        lease.End();
+        Check(stoppedDuringPrepare.Down == 0 && stoppedDuringPrepare.Up == 0 && restores == 6,
+            "voice: STOP during key preparation cancels both hold and tap without toggling IME");
+        var gate = new object();
+        bool preparedOutsideGate = false, checkedInsideGate = false;
+        var guarded = new FakeVoiceHotkey { Prepare = delegate { preparedOutsideGate = !Monitor.IsEntered(gate); } };
+        lease.Begin(guarded, null, delegate {
+            if (Monitor.IsEntered(gate)) checkedInsideGate = true;
+            return true;
+        }, gate);
+        lease.End();
+        Check(preparedOutsideGate && checkedInsideGate && guarded.Down == 1 && guarded.Up == 1,
+            "voice: preparation allows STOP while final validation and press share session lock");
+    }
+
+    static void TestBluetoothDeadlines() {
+        var completed = new TaskCompletionSource<int>();
+        completed.SetResult(42);
+        Check(AsyncDeadline.Wait(completed.Task, CancellationToken.None, 1000, null).GetAwaiter().GetResult() == 42,
+            "BLE: response received before await is retained");
+        bool cancelled = false, timedOut = false;
+        var pending = new TaskCompletionSource<int>();
+        try { AsyncDeadline.Wait(pending.Task, CancellationToken.None, 20, delegate { cancelled = true; }).GetAwaiter().GetResult(); }
+        catch (TimeoutException) { timedOut = true; }
+        Check(timedOut && cancelled, "BLE: hung native operation times out and is cancelled");
+        pending.SetException(new Exception("late native failure"));
+        using (var source = new CancellationTokenSource()) {
+            source.Cancel(); cancelled = false;
+            bool stopped = false;
+            try { AsyncDeadline.Wait(new TaskCompletionSource<int>().Task, source.Token, 10000,
+                    delegate { cancelled = true; }).GetAwaiter().GetResult(); }
+            catch (OperationCanceledException) { stopped = true; }
+            Check(stopped && cancelled, "BLE: reconnect cancels old operation without waiting for timeout");
+        }
+    }
+
+    static void TestHotkeyValidation() {
+        ushort[] parsed;
+        Check(!VkNames.TryParseList(new[] { "LCTRL", "0xFC" }, out parsed) && parsed.Length == 0,
+            "hotkey: Ctrl+unknown is rejected as a whole, never downgraded to Ctrl");
+        Check(VkNames.ParseList(new[] { "LCTRL", "0xFC" }).Length == 0, "hotkey: invalid saved combo injects nothing");
+        Check(VkNames.TryParseList(new[] { " ctrl ", "f13", "CTRL" }, out parsed) && parsed.Length == 2,
+            "hotkey: names match capture vocabulary, case and duplicates handled");
+        Check(VkNames.TryParseList(new[] { "LWIN", "0x48" }, out parsed) && parsed[1] == 0x48,
+            "hotkey: supported numeric key codes remain usable");
+        Check(!VkNames.TryParseList(new[] { "LCTRL", "0xFFFF" }, out parsed), "hotkey: out-of-range key rejected");
+        string prev = Config.OverridePath;
+        string tmp = Path.Combine(Path.GetTempPath(), "mivoicemic_invalid_" + Guid.NewGuid().ToString("N") + ".json");
+        try {
+            Config.OverridePath = tmp;
+            var cfg = new Config(); cfg.hotkey.keys = new List<string> { "LCTRL", "0xFC" }; cfg.Save();
+            var loaded = Config.Load();
+            Check(!loaded.hotkeyEnabled && loaded.hotkey.keys.Count == 2,
+                "hotkey: invalid configuration disables injection without silently replacing user's combo");
+        } finally { Config.OverridePath = prev; if (File.Exists(tmp)) File.Delete(tmp); }
+    }
+
+    sealed class CaptureProbe : ComboCaptureBox {
+        public CaptureProbe() : base("LWIN+H") { }
+        public void Arm() { OnMouseDown(new System.Windows.Forms.MouseEventArgs(System.Windows.Forms.MouseButtons.Left, 1, 2, 2, 0)); }
+        public void Down(System.Windows.Forms.Keys key) { OnKeyDown(new System.Windows.Forms.KeyEventArgs(key)); }
+        public void Up(System.Windows.Forms.Keys key) { OnKeyUp(new System.Windows.Forms.KeyEventArgs(key)); }
+    }
+
+    static void TestComboCapture() {
+        using (var box = new CaptureProbe()) {
+            box.Arm();
+            box.Down(System.Windows.Forms.Keys.ControlKey | System.Windows.Forms.Keys.Control);
+            box.Down(System.Windows.Forms.Keys.LWin | System.Windows.Forms.Keys.Control);
+            box.Down((System.Windows.Forms.Keys)0xFC | System.Windows.Forms.Keys.Control);
+            Check(box.Capturing && box.Value == "LWIN+H", "capture: IME placeholder does not overwrite shortcut");
+            box.Up(System.Windows.Forms.Keys.LWin | System.Windows.Forms.Keys.Control);
+            Check(!box.Capturing && box.Value == "LCTRL+LWIN", "capture: modifier-only Ctrl+Win saved on release");
+            box.Arm(); box.Down(System.Windows.Forms.Keys.H);
+            Check(box.Value == "H", "capture: ordinary key does not acquire a phantom Win modifier");
+            box.Arm(); box.Down(System.Windows.Forms.Keys.Escape);
+            Check(box.Value == "H" && !box.Capturing, "capture: Escape preserves prior combo");
+        }
     }
 
     static short[] MakeSine(int n, double freqHz, int amp) {

@@ -16,15 +16,29 @@ sealed class App : BleVoiceLink.IHandler {
     HotkeyInjector injector;
 
     // key/voice action worker (never inject SendInput from hook or WinRT threads)
-    enum KeyActionKind { VoiceDown, VoiceUp }
-    sealed class KeyAction { public KeyActionKind Kind; }
+    enum KeyActionKind { VoiceDown, VoiceUp, Test }
+    sealed class KeyAction {
+        public KeyActionKind Kind;
+        public long Generation;
+        public IVoiceHotkey Injector;
+        public bool SwitchMic;
+        public int LeadMs;
+        public Action<string> TestProgress;
+    }
     readonly BlockingCollection<KeyAction> keyQueue = new BlockingCollection<KeyAction>();
     Thread keyWorker;
 
     // decode worker (serializes BLE audio notifications)
-    readonly BlockingCollection<byte[]> audioQueue = new BlockingCollection<byte[]>(200);
+    sealed class AudioFrame { public byte[] Data; public long Generation; }
+    readonly BlockingCollection<AudioFrame> audioQueue = new BlockingCollection<AudioFrame>(200);
     Thread audioThread;
 
+    readonly object voiceGate = new object();
+    readonly VoiceSessionGuard session = new VoiceSessionGuard();
+    Timer voiceWatchdog;
+    volatile bool shuttingDown;
+    bool injectionEnabled;
+    readonly VoiceKeySession keySession;
     volatile bool talking;
     volatile bool hotkeyHeld;          // physical voice-key session (HTT, 0x03); drives mic switch + hotkey
     DateTime talkStart;
@@ -40,6 +54,8 @@ sealed class App : BleVoiceLink.IHandler {
         this.cfg = cfg;
         decoder = new AdpcmDecoder(cfg.agc, cfg.gainDb);
         injector = new HotkeyInjector(cfg.hotkey.keys, cfg.hotkey.mode);
+        injectionEnabled = cfg.hotkeyEnabled;
+        keySession = new VoiceKeySession(switcher.Restore);
         link = new BleVoiceLink(cfg, this);
     }
 
@@ -61,6 +77,7 @@ sealed class App : BleVoiceLink.IHandler {
         if (!capOk) Log.Warn("[AUDIO] 未找到录音设备 \"" + cfg.cableCaptureName + "\" - 说话期间将不切换默认麦克风");
 
         // 3. hotkey
+        injector.ForceRelease(); // Recover configured modifiers left by a previous crashed process.
         Log.Info("[KEY] 语音热键: " + injector.Describe() + (cfg.hotkeyEnabled ? "" : " (注入已禁用，切麦/推流照常)"));
 
         // 4. input router (F5 blocker + key mapping) + workers
@@ -71,25 +88,54 @@ sealed class App : BleVoiceLink.IHandler {
         keyWorker.Start();
         audioThread = new Thread(AudioLoop) { IsBackground = true, Name = "decode" };
         audioThread.Start();
+        voiceWatchdog = new Timer(CheckVoiceTimeout, null, 250, 250);
 
         // 5. BLE
         link.Start();
     }
 
     public void Shutdown() {
-        try { injector.ForceRelease(); } catch { }
-        try { switcher.Restore(); } catch { }
+        lock (voiceGate) {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            StopVoiceLocked("程序退出");
+            keyQueue.Add(new KeyAction { Kind = KeyActionKind.VoiceUp });
+            keyQueue.CompleteAdding();
+            audioQueue.CompleteAdding();
+        }
+        if (voiceWatchdog != null) voiceWatchdog.Dispose();
         try { link.Stop(); } catch { }
+        if (keyWorker != null && !keyWorker.Join(3000)) Log.Warn("[KEY] 退出时等待按键释放超时");
+        if (audioThread != null) audioThread.Join(1000);
         try { audioOut.Stop(); } catch { }
         InputRouter.Stop();
-        keyQueue.CompleteAdding();
-        audioQueue.CompleteAdding();
     }
 
-    public void Reconnect() { link.Reconnect(); }
+    public void Reconnect() {
+        lock (voiceGate) {
+            if (shuttingDown) return;
+            StopVoiceLocked("重新连接");
+            session.Stop();
+        }
+        link.Reconnect();
+    }
+
+    public void TestHotkey(ushort[] keys, Action<string> progress) {
+        lock (voiceGate) {
+            if (shuttingDown) return;
+            StopVoiceLocked("测试热键");
+            session.Stop();
+            var names = new List<string>();
+            foreach (ushort key in keys) names.Add(KeyMapNames.Name(key));
+            keyQueue.Add(new KeyAction {
+                Kind = KeyActionKind.Test, Generation = session.Generation,
+                Injector = new HotkeyInjector(names, cfg.hotkey.mode), TestProgress = progress
+            });
+        }
+    }
 
     /// Runtime gain change from the settings UI.
-    public void SetAudioGain(bool agcOn, double gainDb) { decoder.SetGain(agcOn, gainDb); }
+    public void SetAudioGain(bool agcOn, double gainDb) { lock (voiceGate) decoder.SetGain(agcOn, gainDb); }
 
     /// Push 1 s of 440 Hz tone through the cable so the user can verify the
     /// audio path end to end (mute the real mic first if unsure).
@@ -110,7 +156,16 @@ sealed class App : BleVoiceLink.IHandler {
 
     /// Re-apply config changes that can take effect at runtime.
     public void ApplyConfig(Config updated) {
-        injector = new HotkeyInjector(updated.hotkey.keys, updated.hotkey.mode);
+        var next = new HotkeyInjector(updated.hotkey.keys, updated.hotkey.mode);
+        lock (voiceGate) {
+            if (shuttingDown) return;
+            if (next.Describe() != injector.Describe() || injectionEnabled != updated.hotkeyEnabled) {
+                StopVoiceLocked("语音热键设置已改变");
+                session.Stop();
+            }
+            injector = next;
+            injectionEnabled = updated.hotkeyEnabled;
+        }
         InputRouter.SetBlockF5(updated.blockF5);
         InputRouter.SetKeyMap(updated.keymap, updated.deviceMacPrefix);
         Log.Info("[CFG] 热键: " + injector.Describe() + " | 拦截F5: " + (updated.blockF5 ? "开" : "关") +
@@ -121,23 +176,56 @@ sealed class App : BleVoiceLink.IHandler {
         foreach (var act in keyQueue.GetConsumingEnumerable()) {
             try {
                 if (act.Kind == KeyActionKind.VoiceDown) {
-                    if (cfg.switchDefaultMic && AudioOk && switcher.TargetFound) {
-                        switcher.SwitchToTarget();
-                        if (cfg.switchLeadMs > 0) Thread.Sleep(cfg.switchLeadMs);
-                    }
-                    if (cfg.hotkeyEnabled) injector.OnVoiceDown();
+                    Action switchMic = null;
+                    if (act.SwitchMic) switchMic = delegate {
+                        if (switcher.SwitchToTarget() && act.LeadMs > 0) Thread.Sleep(act.LeadMs);
+                    };
+                    keySession.Begin(act.Injector, switchMic, delegate {
+                        lock (voiceGate) return !shuttingDown && session.IsCurrent(act.Generation);
+                    }, voiceGate);
                 } else {
-                    if (cfg.hotkeyEnabled) injector.OnVoiceUp();
-                    switcher.Restore();
+                    keySession.End();
+                    if (act.Kind == KeyActionKind.Test) RunHotkeyTest(act);
                 }
             } catch (Exception ex) { Log.Error("[KEY] worker: " + ex.Message); }
+        }
+        try { keySession.End(); } catch (Exception ex) { Log.Error("[KEY] cleanup: " + ex.Message); }
+    }
+
+    bool TestIsCurrent(KeyAction act) {
+        lock (voiceGate) return !shuttingDown && session.Generation == act.Generation;
+    }
+
+    bool WaitForTest(KeyAction act, int milliseconds) {
+        long until = VoiceSessionGuard.NowMs + milliseconds;
+        while (VoiceSessionGuard.NowMs < until) {
+            if (!TestIsCurrent(act)) return false;
+            Thread.Sleep(20);
+        }
+        return TestIsCurrent(act);
+    }
+
+    void RunHotkeyTest(KeyAction act) {
+        try {
+            for (int count = 3; count > 0; count--) {
+                if (act.TestProgress != null) act.TestProgress(count + " 秒后测试");
+                if (!WaitForTest(act, 1000)) return;
+            }
+            if (act.TestProgress != null) act.TestProgress("测试中…");
+            keySession.Begin(act.Injector, null, delegate { return TestIsCurrent(act); }, voiceGate);
+            WaitForTest(act, 2000);
+        } finally {
+            try { keySession.End(); }
+            finally { if (act.TestProgress != null) act.TestProgress("测试热键"); }
         }
     }
 
     void AudioLoop() {
-        foreach (byte[] frame in audioQueue.GetConsumingEnumerable()) {
+        foreach (AudioFrame frame in audioQueue.GetConsumingEnumerable()) {
             try {
-                var blocks = decoder.Feed(frame);
+              lock (voiceGate) {
+                if (!session.IsCurrent(frame.Generation)) continue;
+                var blocks = decoder.Feed(frame.Data);
                 if (blocks != null) {
                     for (int i = 0; i < blocks.Count; i++) {
                         audioOut.Enqueue(blocks[i]);
@@ -146,6 +234,7 @@ sealed class App : BleVoiceLink.IHandler {
                         UpdateLevel(blocks[i]);
                     }
                 }
+              }
             } catch (Exception ex) { Log.Error("[DECODE] " + ex.Message); }
         }
     }
@@ -168,6 +257,7 @@ sealed class App : BleVoiceLink.IHandler {
             Log.Info("[LINK] 已连接: " + detail);
             TryLateAttachAudio("link");      // VB-CABLE / audio stack may have come up since startup
         } else {
+            lock (voiceGate) { if (!shuttingDown) StopVoiceLocked("蓝牙连接已结束"); }
             Log.Info("[LINK] " + detail);
         }
         UiState.SetStatus(connected, detail, link.RemoteName);
@@ -176,6 +266,8 @@ sealed class App : BleVoiceLink.IHandler {
 
     /// Retry opening the cable if it was missing at startup (throttled to 1/30s).
     void TryLateAttachAudio(string reason) {
+      lock (voiceGate) {
+        if (shuttingDown) return;
         if (AudioOk && switcher.TargetFound) return;
         if ((DateTime.Now - lastAudioRetry).TotalSeconds < 30) return;
         lastAudioRetry = DateTime.Now;
@@ -185,19 +277,24 @@ sealed class App : BleVoiceLink.IHandler {
         }
         if (!switcher.TargetFound && switcher.FindTarget(cfg.cableCaptureName))
             Log.Info("[AUDIO] late-attach capture OK (" + reason + ")");
+      }
     }
 
     public void OnCaps(int version, int frameSize, int codec) {
-        decoder.FrameSize = frameSize;
+        lock (voiceGate) decoder.FrameSize = frameSize;
     }
 
     public void OnVoiceStart(byte sessionId, byte interaction) {
+      lock (voiceGate) {
+        if (shuttingDown || interaction != 0x03 || session.IsDuplicate(sessionId)) return;
+        StopVoiceLocked("新语音会话替换旧会话");
         TryLateAttachAudio("voice");         // first real use: make sure the cable is there
+        session.Start(sessionId, VoiceSessionGuard.NowMs);
         talking = true;
         framesDecoded = 0;
         talkStart = DateTime.Now;
         decoder.ResetSession();
-        byte[] stale;
+        AudioFrame stale;
         while (audioQueue.TryTake(out stale)) { }         // drain stale audio
         if (cfg.dumpAudio) dumpBuffer = new List<short>(16000 * 2);
         // 0x03 = HTT (voice key physically held); other reasons are firmware-initiated
@@ -209,15 +306,44 @@ sealed class App : BleVoiceLink.IHandler {
         Log.Voice(">>> 语音会话开始 (session " + sessionId + ", interaction " + interaction +
                   (hotkeyHeld ? ", 语音键按下" : ", 固件自启(不注入热键)") + ")");
         if (hotkeyHeld)
-            keyQueue.Add(new KeyAction { Kind = KeyActionKind.VoiceDown });   // mic switch runs even with injection disabled
+            keyQueue.Add(new KeyAction {
+                Kind = KeyActionKind.VoiceDown, Generation = session.Generation,
+                Injector = injectionEnabled ? injector : null,
+                SwitchMic = cfg.switchDefaultMic && AudioOk && switcher.TargetFound,
+                LeadMs = Math.Max(0, Math.Min(1000, cfg.switchLeadMs))
+            });
+      }
     }
 
     public void OnVoiceStop() {
+        lock (voiceGate) { if (!shuttingDown) StopVoiceLocked(null); }
+    }
+
+    void CheckVoiceTimeout(object state) {
+        string reason;
+        try {
+            lock (voiceGate) {
+                if (shuttingDown) return;
+                reason = session.TimeoutReason(VoiceSessionGuard.NowMs);
+                if (reason == null) return;
+                Log.Warn("[VOICE] " + reason + "，释放热键并自动重连");
+                StopVoiceLocked(reason);
+            }
+            link.Reconnect();
+        } catch (Exception ex) { Log.Warn("[VOICE] 自动恢复: " + ex.Message); }
+    }
+
+    // Caller owns voiceGate. Release keys before any config or WAV file I/O.
+    void StopVoiceLocked(string reason) {
         if (!talking) return;
         talking = false;
+        session.Stop();
+        if (hotkeyHeld) keyQueue.Add(new KeyAction { Kind = KeyActionKind.VoiceUp });
+        hotkeyHeld = false;
         double secs = (DateTime.Now - talkStart).TotalSeconds;
-        Log.Voice("<<< 松开语音键 (" + framesDecoded + " 帧, " + secs.ToString("0.0") + "s)");
+        Log.Voice("<<< 松开语音键 (" + framesDecoded + " 帧, " + secs.ToString("0.0") + "s)" + (reason == null ? "" : " — " + reason));
         UiState.SetTalking(false);
+        UiState.SetLevel(0);
         if (framesDecoded > 0) {             // sessions with no decoded audio (firmware self-start) don't count
             lock (cfg) {
                 cfg.stats.AddSession(secs);
@@ -231,18 +357,18 @@ sealed class App : BleVoiceLink.IHandler {
             catch (Exception ex) { Log.Warn("[DUMP] " + ex.Message); }
         }
         dumpBuffer = null;
-        if (hotkeyHeld)
-            keyQueue.Add(new KeyAction { Kind = KeyActionKind.VoiceUp });
-        hotkeyHeld = false;
     }
 
     public void OnSync(int predictor, int stepIndex) {
-        decoder.ApplySync(predictor, stepIndex);
+        lock (voiceGate) decoder.ApplySync(predictor, stepIndex);
     }
 
     public void OnAudioFrame(byte[] frame) {
-        if (!talking) return;
-        if (!audioQueue.TryAdd(frame)) { /* queue full: drop, streamer keeps up from buffered frames */ }
+        lock (voiceGate) {
+            if (shuttingDown || !talking || frame == null || frame.Length == 0) return;
+            session.Audio(VoiceSessionGuard.NowMs);
+            audioQueue.TryAdd(new AudioFrame { Data = frame, Generation = session.Generation });
+        }
     }
 
     public void OnBattery(int percent) {

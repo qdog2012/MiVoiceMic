@@ -11,6 +11,7 @@
 // 中文：SendInput 组合键注入 —— 输入法语音热键的按住/点按控制
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 static class VkNames {
@@ -26,30 +27,42 @@ static class VkNames {
     };
 
     public static bool TryParse(string name, out ushort vk) {
-        if (string.IsNullOrEmpty(name)) { vk = 0; return false; }
+        vk = 0;
+        if (string.IsNullOrWhiteSpace(name)) return false;
         if (map.TryGetValue(name.Trim(), out vk)) return true;
-        if (name.Length == 1) {
-            char c = name[0];
-            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')) { vk = (ushort)c; return true; }
+        return KeyMapNames.TryParse(name, out vk) && IsSupported(vk);
+    }
+
+    public static bool IsSupported(ushort vk) {
+        return vk > 0 && vk < 0xFF && !KeyMapNames.Name(vk).StartsWith("0x", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool TryParseList(IList<string> names, out ushort[] keys) {
+        keys = new ushort[0];
+        if (names == null || names.Count == 0) return false;
+        var list = new List<ushort>();
+        foreach (string n in names) {
+            ushort vk;
+            if (!TryParse(n, out vk)) return false;
+            if (!list.Contains(vk)) list.Add(vk);
         }
-        return false;
+        keys = list.ToArray();
+        return keys.Length > 0;
     }
 
     public static ushort[] ParseList(IList<string> names) {
-        var list = new List<ushort>();
-        if (names != null)
-            foreach (string n in names) {
-                ushort vk;
-                if (TryParse(n, out vk) && !list.Contains(vk)) list.Add(vk);
-                else if (!string.IsNullOrEmpty(n)) Log.Warn("[CFG] unknown key name: " + n);
-            }
-        if (list.Count == 0) { list.Add(0xA2); list.Add(0x5B); }   // Ctrl+Win fallback (WeType default)
-        return list.ToArray();
+        if (names == null || names.Count == 0) return new ushort[] { 0xA2, 0x5B };
+        ushort[] keys;
+        if (TryParseList(names, out keys)) return keys;
+        Log.Warn("[CFG] 无效语音组合键，已停止注入（请重新设置完整快捷键）");
+        return new ushort[0];
     }
 }
 
-sealed class HotkeyInjector {
-    [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+sealed class HotkeyInjector : IVoiceHotkey {
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint mapType);
     [DllImport("user32.dll")] static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
@@ -76,6 +89,7 @@ sealed class HotkeyInjector {
     }
 
     public string Describe() {
+        if (combo.Length == 0) return "已禁用（无效快捷键）";
         var parts = new List<string>();
         foreach (ushort vk in combo) parts.Add("0x" + vk.ToString("X2"));
         return string.Join("+", parts.ToArray()) + (tapMode ? " (tap x2)" : " (hold)");
@@ -101,18 +115,33 @@ sealed class HotkeyInjector {
     static bool PressAll(ushort[] keys) {
         var inputs = new INPUT[keys.Length];
         for (int i = 0; i < keys.Length; i++) inputs[i] = Make(keys[i], true);
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT))) == inputs.Length;
+        return SendChecked(inputs, "按下", keys);
     }
     static bool ReleaseAll(ushort[] keys) {
         var inputs = new INPUT[keys.Length];
         for (int i = 0; i < keys.Length; i++) inputs[i] = Make(keys[keys.Length - 1 - i], false);
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT))) == inputs.Length;
+        return SendChecked(inputs, "松开", keys);
     }
     static bool TapOnce(ushort[] keys) {
         var inputs = new INPUT[keys.Length * 2];
         for (int i = 0; i < keys.Length; i++) inputs[i] = Make(keys[i], true);
         for (int i = 0; i < keys.Length; i++) inputs[keys.Length + i] = Make(keys[keys.Length - 1 - i], false);
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT))) == (uint)inputs.Length;
+        return SendChecked(inputs, "点按", keys);
+    }
+
+    static bool SendChecked(INPUT[] inputs, string action, ushort[] keys) {
+        string target = "未知";
+        try {
+            uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+            using (var process = Process.GetProcessById((int)pid)) target = process.ProcessName;
+        } catch { }
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        int error = Marshal.GetLastWin32Error();
+        string detail = "[KEY] " + action + " " + KeyMapNames.FriendlyCombo(keys) +
+            ": " + sent + "/" + inputs.Length + "，前台应用=" + target;
+        if (sent == inputs.Length) Log.Info(detail);
+        else Log.Warn(detail + "，系统错误=" + error);
+        return sent == inputs.Length;
     }
 
     static void ForcedRelease(ushort vk) {
@@ -120,12 +149,21 @@ sealed class HotkeyInjector {
         keybd_event((byte)vk, (byte)MapVirtualKey(vk, MAPVK_VK_TO_VSC), flags, UIntPtr.Zero);
     }
 
-    /// Voice key pressed: default-mic already switched by caller.
-    public void OnVoiceDown() {
+    /// Release stale keys before the cancellable settling period.
+    public void PrepareVoiceDown() {
+        if (combo.Length == 0) return;
         InputRouter.Suspend();
         try {
             foreach (ushort vk in combo) ForcedRelease(vk);   // clean slate
-            System.Threading.Thread.Sleep(50);
+        } finally { InputRouter.Resume(); }
+        System.Threading.Thread.Sleep(50);
+    }
+
+    /// Caller rechecks session validity after PrepareVoiceDown, before committing.
+    public void OnVoiceDown() {
+        if (combo.Length == 0) return;
+        InputRouter.Suspend();
+        try {
             if (tapMode) {
                 if (!TapOnce(combo)) Log.Warn("[KEY] tap down failed");
             } else {
@@ -136,6 +174,7 @@ sealed class HotkeyInjector {
 
     /// Voice key released.
     public void OnVoiceUp() {
+        if (combo.Length == 0) return;
         InputRouter.Suspend();
         try {
             if (tapMode) {
@@ -148,10 +187,11 @@ sealed class HotkeyInjector {
 
     /// Safety net: release held keys (on exit / link loss).
     public void ForceRelease() {
+        if (combo.Length == 0) return;
+        InputRouter.Suspend();
         try {
-            InputRouter.Suspend();
             foreach (ushort vk in combo) ForcedRelease(vk);
-            InputRouter.Resume();
         } catch (Exception ex) { Log.Warn("[KEY] force release: " + ex.Message); }
+        finally { InputRouter.Resume(); }
     }
 }

@@ -69,8 +69,9 @@ static class E2E {
         string before = DeviceSwitcher.CurrentDefaultCaptureName();
         sw.SwitchToTarget();
         string during = DeviceSwitcher.CurrentDefaultCaptureName();
-        bool switched = during != null && during != before;
-        Console.WriteLine("[2] 默认麦克风: \"" + before + "\" -> \"" + during + "\" " + (switched ? "OK" : "(未变化!)"));
+        // The cable may already be the default microphone before the test.
+        bool switched = during != null && during.IndexOf(cfg.cableCaptureName, StringComparison.OrdinalIgnoreCase) >= 0;
+        Console.WriteLine("[2] 默认麦克风: \"" + before + "\" -> \"" + during + "\" " + (switched ? "OK" : "(目标不匹配!)"));
         if (!switched) { sw.Restore(); Console.WriteLine("FAIL: 默认麦克风切换未生效"); return 1; }
 
         // 4. open CABLE Input + play
@@ -79,7 +80,7 @@ static class E2E {
         int hr = waveOutOpen(out hWave, cableIdxFound, ref wfx, IntPtr.Zero, IntPtr.Zero, 0);
         if (hr != 0) { sw.Restore(); Console.WriteLine("FAIL: 打开 " + cfg.cableRenderName + " 失败 err=" + hr); return 1; }
         var injector = inject ? new HotkeyInjector(cfg.hotkey.keys, cfg.hotkey.mode) : null;
-        if (injector != null) { Console.WriteLine("[3] 注入语音热键 " + injector.Describe()); injector.OnVoiceDown(); }
+        if (injector != null) { Console.WriteLine("[3] 注入语音热键 " + injector.Describe()); injector.PrepareVoiceDown(); injector.OnVoiceDown(); }
 
         byte[] raw = new byte[pcm.Length * 2];
         Buffer.BlockCopy(pcm, 0, raw, 0, raw.Length);

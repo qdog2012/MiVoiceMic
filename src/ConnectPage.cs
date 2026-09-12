@@ -202,6 +202,13 @@ class ConnectPage : MacPage {
         if (!KeyMapNames.TryParseCombo(comboBox.Value, out parsed) || parsed.Length == 0) return;
         var names = new System.Collections.Generic.List<string>();
         foreach (ushort v in parsed) names.Add(KeyMapNames.Name(v));
+        ushort[] validated;
+        if (!VkNames.TryParseList(names, out validated)) {
+            comboBox.Value = ComboText();
+            comboBox.Invalidate();
+            MessageBox.Show(this, "未能识别完整快捷键，请重新按下组合键。原设置已保留。", "语音热键");
+            return;
+        }
         cfg.hotkey.keys = names;
         cfg.hotkey.preset = "custom";
         cfg.hotkeyEnabled = true;
@@ -229,10 +236,20 @@ class ConnectPage : MacPage {
 
     void TestHotkey() {
         try {
-            ushort[] vks = VkNames.ParseList(App.Config.hotkey.keys);
-            if (vks.Length == 0) return;
-            KeySender.Tap(vks);
-            Log.Info("[UI] 测试热键: " + KeyMapNames.FriendlyCombo(vks));
+            ushort[] vks;
+            if (!VkNames.TryParseList(App.Config.hotkey.keys, out vks)) {
+                MessageBox.Show(this, "快捷键无效，请先重新设置完整组合键。", "语音热键");
+                return;
+            }
+            testHotkeyBtn.Enabled = false;
+            App.TestHotkey(vks, delegate(string caption) {
+                try { BeginInvoke((MethodInvoker)delegate {
+                    testHotkeyBtn.Caption = caption;
+                    testHotkeyBtn.Enabled = caption == "测试热键";
+                    testHotkeyBtn.Invalidate();
+                }); } catch { }
+            });
+            Log.Info("[UI] 3 秒后测试热键: " + KeyMapNames.FriendlyCombo(vks) + "；请切到文字输入框，测试持续 2 秒");
         } catch (Exception ex) { Log.Error("[UI] test hotkey: " + ex.Message); }
     }
 
@@ -380,7 +397,7 @@ class ConnectPage : MacPage {
             Gfx.Text(g, "不注入热键：仅把遥控器语音推流到虚拟声卡（自动切麦不受影响）", smallFont, MacTheme.TextTertiary,
                 new RectangleF(MacTheme.S(16), MacTheme.S(168), w - MacTheme.S(32), MacTheme.S(16)), StringAlignment.Near);
         } else {
-            Gfx.Text(g, "测试热键 = 立即点按一次上面的组合键；改组合键会切换为「自定义」", smallFont, MacTheme.TextTertiary,
+            Gfx.Text(g, "测试：3 秒内切到文字输入框，再按当前模式测试 2 秒", smallFont, MacTheme.TextTertiary,
                 new RectangleF(MacTheme.S(16), MacTheme.S(168), w - MacTheme.S(32), MacTheme.S(16)), StringAlignment.Near);
         }
     }

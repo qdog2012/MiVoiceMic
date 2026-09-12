@@ -106,6 +106,11 @@ class Config {
                 cfg.hotkey.preset = GetStr(hk, "preset", cfg.hotkey.preset);
             }
             cfg.keymap.Normalize();
+            ushort[] hotkeyKeys;
+            if (!VkNames.TryParseList(cfg.hotkey.keys, out hotkeyKeys)) {
+                cfg.hotkeyEnabled = false;
+                Log.Warn("[CFG] 语音快捷键不完整，已禁用热键注入，请重新设置");
+            }
         } catch (Exception ex) {
             Log.Error("config: failed to parse " + path + " (" + ex.Message + "), using defaults");
         }

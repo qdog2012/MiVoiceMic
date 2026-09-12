@@ -24,7 +24,7 @@ if not exist "%CSC%" (
   /r:"C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Speech\v4.0_4.0.0.0__31bf3856ad364e35\System.Speech.dll" ^
   /out:MiVoiceMic.new.exe ^
   src\Log.cs src\Config.cs src\KeyMap.cs src\AdpcmDecoder.cs src\AudioOut.cs src\DeviceSwitcher.cs ^
-  src\HotkeyInjector.cs src\RemoteKeys.cs src\BleVoiceLink.cs src\App.cs src\TrayIcon.cs src\MacUi.cs ^
+  src\HotkeyInjector.cs src\VoiceSession.cs src\RemoteKeys.cs src\BleVoiceLink.cs src\App.cs src\TrayIcon.cs src\MacUi.cs ^
   src\MainWindow.cs src\ConnectPage.cs src\KeyMapPage.cs src\KeyMapEditor.cs src\DiagPage.cs src\AboutPage.cs ^
   src\SelfTest.cs src\E2E.cs src\Program.cs
 if errorlevel 1 exit /b %errorlevel%
