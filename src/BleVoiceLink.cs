@@ -25,6 +25,16 @@ using Windows.Devices.Bluetooth.Advertisement;
 using Windows.Devices.Enumeration;
 using Windows.Storage.Streams;
 
+sealed class RemoteDeviceStatus {
+    public string Name;
+    public bool? Connected;
+}
+
+sealed class RemoteConnectionReport {
+    public readonly List<RemoteDeviceStatus> Devices = new List<RemoteDeviceStatus>();
+    public string Error;
+}
+
 sealed class BleVoiceLink {
     static readonly Guid SVC   = new Guid("ab5e0001-5a21-4f05-bc7d-af01f617b664");
     static readonly Guid C_CMD = new Guid("ab5e0002-5a21-4f05-bc7d-af01f617b664");
@@ -621,10 +631,41 @@ sealed class BleVoiceLink {
 
     // ======================= diagnostics helpers (for --check) =======================
 
+    public static bool IsDiagnosticRemote(string name, string address, Config config) {
+        if (!string.IsNullOrWhiteSpace(name)) foreach (string want in config.deviceNames)
+            if (string.Equals(name.Trim(), want.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+        string prefix = (config.deviceMacPrefix ?? "").Replace(":", "").Replace("-", "");
+        string mac = (address ?? "").Replace(":", "").Replace("-", "");
+        return prefix.Length > 0 && mac.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static RemoteConnectionReport ReadRemoteConnection(Config config) {
+        var report = new RemoteConnectionReport();
+        try {
+            // AEP properties are a read-only system snapshot. Do not create/dispose
+            // a BluetoothLEDevice or discover GATT services just to check status.
+            const string connectedKey = "System.Devices.Aep.IsConnected";
+            const string addressKey = "System.Devices.Aep.DeviceAddress";
+            var devices = AsT(DeviceInformation.FindAllAsync(
+                BluetoothLEDevice.GetDeviceSelectorFromPairingState(true),
+                new[] { connectedKey, addressKey }, DeviceInformationKind.AssociationEndpoint)).GetAwaiter().GetResult();
+            if (devices != null) foreach (var d in devices) {
+                object value;
+                string address = d.Properties.TryGetValue(addressKey, out value) ? Convert.ToString(value) : "";
+                if (!IsDiagnosticRemote(d.Name, address, config)) continue;
+                bool? connected = d.Properties.TryGetValue(connectedKey, out value) && value is bool ? (bool?)value : null;
+                report.Devices.Add(new RemoteDeviceStatus {
+                    Name = string.IsNullOrWhiteSpace(d.Name) ? address : d.Name, Connected = connected
+                });
+            }
+        } catch (Exception ex) { report.Error = ex.Message; }
+        return report;
+    }
+
     /// All paired Bluetooth LE device names.
     public static List<string> ListPairedBleNames() {
         var names = new List<string>();
-        var devs = AsT(DeviceInformation.FindAllAsync(BluetoothLEDevice.GetDeviceSelector())).GetAwaiter().GetResult();
+        var devs = AsT(DeviceInformation.FindAllAsync(BluetoothLEDevice.GetDeviceSelectorFromPairingState(true))).GetAwaiter().GetResult();
         if (devs != null)
             foreach (var d in devs)
                 if (!string.IsNullOrEmpty(d.Name)) names.Add(d.Name);

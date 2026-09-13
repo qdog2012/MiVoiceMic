@@ -35,9 +35,47 @@ static class SelfTest {
         TestBluetoothDeadlines();
         TestHotkeyValidation();
         TestComboCapture();
+        TestRemoteConnectionChecks();
         UpdateTests.Run(Check);
         Console.WriteLine("== " + passed + " passed, " + failed + " failed ==");
         return failed == 0 ? 0 : 1;
+    }
+
+    static void TestRemoteConnectionChecks() {
+        var report = new RemoteConnectionReport();
+        var device = new RemoteDeviceStatus { Name = "MI RC", Connected = false };
+        report.Devices.Add(device);
+        var waiting = new UiState.Snapshot { Linked = false, Status = "正在重新连接遥控器..." };
+        Check(EnvChecks.PairingCheck(report).State == CheckState.Ok && EnvChecks.ConnectionCheck(report, waiting).State == CheckState.Fail,
+            "diagnostics: paired remote does not pass disconnected Bluetooth check");
+        device.Connected = true;
+        var connecting = EnvChecks.ConnectionCheck(report, waiting);
+        Check(connecting.State == CheckState.Warn && string.Join("\n", connecting.Lines).Contains("语音通道：未就绪"),
+            "diagnostics: Bluetooth connection alone does not imply usable voice channel");
+        var ready = new UiState.Snapshot { Linked = true, Device = "MI RC", Status = "MI RC" };
+        Check(EnvChecks.ConnectionCheck(report, ready).State == CheckState.Ok,
+            "diagnostics: Bluetooth plus completed voice handshake passes");
+        device.Connected = false;
+        Check(EnvChecks.ConnectionCheck(report, ready).State == CheckState.Warn,
+            "diagnostics: stale voice-ready flag cannot override system disconnection");
+        device.Connected = null;
+        Check(EnvChecks.ConnectionCheck(report, waiting).State == CheckState.Warn,
+            "diagnostics: absent connection property is unknown, not paired-as-connected");
+        report.Error = "read timeout";
+        Check(EnvChecks.ConnectionCheck(report, ready).State == CheckState.Warn,
+            "diagnostics: query failure remains visible even if program reports ready");
+        report.Error = null;
+        device.Connected = true;
+        var cli = EnvChecks.ConnectionCheck(report, null);
+        Check(cli.State == CheckState.Ok && !string.Join("\n", cli.Lines).Contains("语音通道：已就绪"),
+            "diagnostics: standalone checker does not invent another process's voice state");
+        Check(EnvChecks.PairingCheck(new RemoteConnectionReport()).State == CheckState.Fail,
+            "diagnostics: no paired remote is a failed prerequisite");
+        var cfg = new Config();
+        Check(!BleVoiceLink.IsDiagnosticRemote("Bluetooth Mouse", "00:11:22:33:44:55", cfg) &&
+            BleVoiceLink.IsDiagnosticRemote(" MI RC ", "", cfg) &&
+            BleVoiceLink.IsDiagnosticRemote("renamed remote", "c0-5d-39-c3-60-95", cfg),
+            "diagnostics: only configured remote names or address prefix count");
     }
 
     static void TestVoiceRecovery() {

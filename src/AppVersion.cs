@@ -7,5 +7,5 @@ using System.Reflection;
 
 static class AppVersion {
     // Keep the release tag and packaged executable in sync (checked by package-release.ps1).
-    public const string Number = "1.0.4";
+    public const string Number = "1.0.5";
 }

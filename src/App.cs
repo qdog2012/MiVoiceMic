@@ -49,6 +49,7 @@ sealed class App : BleVoiceLink.IHandler {
     public bool AudioOk { get; private set; }
     public bool SwitcherOk { get { return switcher.TargetFound; } }
     public Config Config { get { return cfg; } }
+    public bool IsRunning { get { return keyWorker != null && !shuttingDown; } }
 
     public App(Config cfg) {
         this.cfg = cfg;

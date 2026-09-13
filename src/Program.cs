@@ -151,14 +151,14 @@ static class Diag {
         foreach (var item in items) {
             Console.WriteLine();
             Console.WriteLine("[" + item.Title + "]");
-            string mark = item.State == CheckState.Ok ? "  ✓ " : item.State == CheckState.Warn ? "  ! " : "  ✗ ";
-            if (item.State == CheckState.Fail) ok = false;
+            string mark = item.State == CheckState.Ok ? "  ✓ " : item.State == CheckState.Fail ? "  ✗ " : "  ! ";
+            if (item.Required && item.State != CheckState.Ok) ok = false;
             for (int i = 0; i < item.Lines.Count; i++)
                 Console.WriteLine((i == 0 ? mark : "    ") + item.Lines[i]);
         }
         Console.WriteLine();
         Console.WriteLine("== 结论 ==");
-        Console.WriteLine("  " + (ok ? "环境就绪，直接运行 MiVoiceMic.exe，按住遥控器语音键说话。"
+        Console.WriteLine("  " + (ok ? "系统环境已就绪；主程序显示语音通道就绪后，即可按住遥控器语音键说话。"
                                       : "完成上述缺失项后重新运行 MiVoiceMic.exe 即可。"));
         return ok ? 0 : 1;
     }
