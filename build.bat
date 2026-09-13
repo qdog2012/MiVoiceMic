@@ -27,7 +27,7 @@ if not exist "%CSC%" (
   src\Log.cs src\Config.cs src\KeyMap.cs src\AdpcmDecoder.cs src\AudioOut.cs src\DeviceSwitcher.cs ^
   src\HotkeyInjector.cs src\VoiceSession.cs src\RemoteKeys.cs src\BleVoiceLink.cs src\App.cs src\TrayIcon.cs src\MacUi.cs ^
   src\MainWindow.cs src\ConnectPage.cs src\KeyMapPage.cs src\KeyMapEditor.cs src\DiagPage.cs src\AboutPage.cs ^
-  src\AppVersion.cs src\AppUpdater.cs src\UpdateTests.cs src\SelfTest.cs src\E2E.cs src\Program.cs
+  src\AppVersion.cs src\AppUpdater.cs src\AppStartup.cs src\UpdateTests.cs src\SelfTest.cs src\E2E.cs src\Program.cs
 if errorlevel 1 exit /b %errorlevel%
 
 rem bundle the RemoteMapper driver package for the in-app installer

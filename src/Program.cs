@@ -1,7 +1,7 @@
 // Program.cs - entry point: default run (GUI + tray), --check (environment
 // self-check), --selftest (offline logic tests), --sniff (keyboard sniffer),
 // --screenshot (render UI pages to PNG without showing a window).
-// 中文：入口 —— 默认 GUI 启动，附 --check/--selftest/--e2e/--sniff/--screenshot 工具模式
+// 中文：入口 —— 手动显示窗口，--autostart 仅托盘，另附诊断工具模式
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -22,11 +22,12 @@ static class Program {
     [STAThread]
     static int Main(string[] args) {
         string mode = args != null && args.Length > 0 ? args[0].ToLowerInvariant() : "";
+        bool startInTray = mode == "--autostart";
         // The copied update helper must never initialize Bluetooth, hooks, config or a console.
         if (mode == "--apply-update") return AppUpdater.RunHelper();
         // winexe build has no console; tool modes re-attach to the calling
         // terminal (or allocate one) so --check/--sniff/--e2e output is visible
-        if (mode.Length > 0 && !AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
+        if (mode.Length > 0 && !startInTray && !AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
         try { SetConsoleOutputCP(65001); } catch { }
         try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
         if (mode == "--selftest") return SelfTest.Run();
@@ -42,8 +43,20 @@ static class Program {
             } catch (Exception ex) { Console.WriteLine(AppUpdater.FriendlyError(ex)); return 1; }
         }
 
+        using (var instance = new AppInstance(System.Windows.Forms.Application.ExecutablePath)) {
+            if (!instance.IsPrimary) {
+                if (!startInTray) instance.RequestShow();
+                return 0;
+            }
+            return RunApplication(instance, startInTray);
+        }
+    }
+
+    static int RunApplication(AppInstance instance, bool startInTray) {
         Log.Init(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "MiVoiceMic.log"));
         Log.Info("MiVoiceMic starting (pid " + Process.GetCurrentProcess().Id + ")");
+        Log.Info(startInTray ? "[STARTUP] 开机自启：仅显示托盘图标" : "[STARTUP] 手动启动：显示主界面");
+        AutoStart.UpgradeExistingRegistration();
 
         try { SetProcessDpiAwarenessContext((IntPtr)(-4)); } catch { try { SetProcessDPIAware(); } catch { } }
 
@@ -53,10 +66,12 @@ static class Program {
         System.Windows.Forms.Application.EnableVisualStyles();
         AppUpdater.Interactive = true;
         MacTheme.Init();
-        var main = new MainWindow(app);
-        TrayIcon.MainWindow = main;
-        TrayIcon.Create(app);
-        System.Windows.Forms.Application.Run(main);
+        using (var main = new MainWindow(app)) {
+            TrayIcon.MainWindow = main;
+            TrayIcon.Create(app);
+            using (var context = new TrayApplicationContext(main, instance, startInTray))
+                System.Windows.Forms.Application.Run(context);
+        }
         app.Shutdown();
 
         Log.Info("bye");

@@ -1,5 +1,5 @@
 // TrayIcon.cs - WinForms notify icon: status, preset switching, toggles, reconnect.
-// The main window owns the message loop; this class only creates the icon/menu.
+// TrayApplicationContext owns the message loop; this class creates the icon/menu.
 // Status updates arrive from BLE threads; they are cached here and applied on the
 // UI thread by a timer tick (no cross-thread control access).
 // 中文：托盘图标 —— 状态/预设/开关快捷菜单；含 AutoStart 开机自启（HKCU Run 键）助手
@@ -92,7 +92,7 @@ static class TrayIcon {
         Environment.Exit(0);
     }
 
-    static void ShowMain() {
+    public static void ShowMain() {
         if (MainWindow != null) { MainWindow.Show(); MainWindow.WindowState = FormWindowState.Normal; ActivateWindow(MainWindow); }
     }
 
@@ -202,6 +202,26 @@ static class AutoStart {
     const string KeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string ValueName = "MiVoiceMic";
 
+    public static string Command(string executablePath) { return "\"" + executablePath + "\" --autostart"; }
+
+    public static void UpgradeExistingRegistration() {
+        // Migrate the old command only for this installation. Never enable a
+        // disabled startup entry or redirect another copy's registration.
+        try {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(KeyPath, true)) {
+                if (k == null) return;
+                string value = k.GetValue(ValueName) as string;
+                if (value == null) return;
+                string exe = Application.ExecutablePath;
+                if (string.Equals(value.Trim(), "\"" + exe + "\"", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(value.Trim(), exe, StringComparison.OrdinalIgnoreCase)) {
+                    k.SetValue(ValueName, Command(exe));
+                    Log.Info("[AUTOSTART] 已将现有开机自启改为托盘启动");
+                }
+            }
+        } catch (Exception ex) { Log.Error("[AUTOSTART] migrate: " + ex.Message); }
+    }
+
     public static bool IsEnabled() {
         try {
             using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(KeyPath))
@@ -212,7 +232,7 @@ static class AutoStart {
     public static void Set(bool on) {
         try {
             using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(KeyPath)) {
-                if (on) k.SetValue(ValueName, "\"" + Application.ExecutablePath + "\"");
+                if (on) k.SetValue(ValueName, Command(Application.ExecutablePath));
                 else k.DeleteValue(ValueName, false);
             }
         } catch (Exception ex) { Log.Error("[AUTOSTART] " + ex.Message); }
