@@ -16,6 +16,10 @@ sealed class AudioOut {
     [DllImport("winmm.dll")]
     static extern int waveOutPrepareHeader(IntPtr hwo, IntPtr pwh, int cbwh);
     [DllImport("winmm.dll")]
+    static extern int waveOutUnprepareHeader(IntPtr hwo, IntPtr pwh, int cbwh);
+    [DllImport("winmm.dll")]
+    static extern int waveOutMessage(IntPtr device, uint message, IntPtr parameter, IntPtr reserved);
+    [DllImport("winmm.dll")]
     static extern int waveOutWrite(IntPtr hwo, IntPtr pwh, int cbwh);
     [DllImport("winmm.dll")]
     static extern int waveOutReset(IntPtr hwo);
@@ -51,43 +55,69 @@ sealed class AudioOut {
     public string DeviceUsed { get; private set; }
     public long FramesPlayed { get; private set; }
     public long FramesDropped { get; private set; }
+    public string LastError { get; private set; }
 
     /// List render device names (for diagnostics).
     public static List<string> ListRenderDevices() {
         var names = new List<string>();
-        uint n = waveOutGetNumDevs();
-        for (uint i = 0; i < n; i++) {
-            var c = new WAVEOUTCAPS();
-            if (waveOutGetDevCaps(i, ref c, Marshal.SizeOf(c)) == 0 && c.name != null)
-                names.Add(c.name);
-        }
+        foreach (var device in ListRenderEndpoints()) names.Add(device.Name);
         return names;
     }
 
-    public bool Start(string nameContains, int sr) {
+    public static List<AudioDeviceInfo> ListRenderEndpoints() {
+        var devices = new List<AudioDeviceInfo>();
+        List<AudioDeviceInfo> endpoints;
+        try { endpoints = DeviceSwitcher.ListRenderEndpoints(); }
+        catch { endpoints = new List<AudioDeviceInfo>(); }
         uint n = waveOutGetNumDevs();
-        uint idx = 0xFFFFFFFF; bool found = false;
         for (uint i = 0; i < n; i++) {
             var c = new WAVEOUTCAPS();
-            waveOutGetDevCaps(i, ref c, Marshal.SizeOf(c));
-            if (c.name != null && c.name.IndexOf(nameContains, StringComparison.OrdinalIgnoreCase) >= 0) {
-                idx = i; found = true; DeviceUsed = c.name;
-            }
+            if (waveOutGetDevCaps(i, ref c, Marshal.SizeOf(c)) != 0 || c.name == null) continue;
+            string id = RenderEndpointId(i);
+            var device = new AudioDeviceInfo { WaveId = i, Id = id, Name = c.name, LegacyName = c.name };
+            foreach (var ep in endpoints)
+                if (string.Equals(ep.Id, id, StringComparison.OrdinalIgnoreCase)) { device.Name = ep.Name; break; }
+            devices.Add(device);
         }
-        if (!found) return false;
+        return devices;
+    }
+
+    static string RenderEndpointId(uint index) {
+        IntPtr size = Marshal.AllocHGlobal(4), text = IntPtr.Zero;
+        try {
+            Marshal.WriteInt32(size, 0);
+            // DRV_QUERYFUNCTIONINSTANCEIDSIZE / DRV_QUERYFUNCTIONINSTANCEID.
+            if (waveOutMessage((IntPtr)index, 0x812, size, IntPtr.Zero) != 0) return null;
+            int bytes = Marshal.ReadInt32(size);
+            if (bytes < 2 || bytes > 65536) return null;
+            text = Marshal.AllocHGlobal(bytes);
+            if (waveOutMessage((IntPtr)index, 0x811, text, (IntPtr)bytes) != 0) return null;
+            return Marshal.PtrToStringUni(text);
+        } finally { Marshal.FreeHGlobal(size); if (text != IntPtr.Zero) Marshal.FreeHGlobal(text); }
+    }
+
+    public bool Start(string nameContains, int sr, string endpointId = null) {
+        Stop();
+        LastError = null;
+        var device = AudioDevices.Resolve(ListRenderEndpoints(), nameContains, endpointId);
+        if (device == null) { LastError = "未找到唯一匹配的播放设备：" + nameContains; return false; }
+        DeviceUsed = device.Name;
 
         var wfx = new WAVEFORMATEX { tag = 1, ch = 1, sr = (uint)sr, avg = (uint)(sr * 2), blk = 2, bits = 16, cb = 0 };
-        int hr = waveOutOpen(out hWave, idx, ref wfx, IntPtr.Zero, IntPtr.Zero, 0);
-        if (hr != 0) { hWave = IntPtr.Zero; return false; }
+        int hr = waveOutOpen(out hWave, device.WaveId, ref wfx, IntPtr.Zero, IntPtr.Zero, 0);
+        if (hr != 0) { hWave = IntPtr.Zero; LastError = "播放设备无法打开（错误 " + hr + "）：" + DeviceUsed; return false; }
 
-        for (int i = 0; i < NB; i++) {
-            data[i] = Marshal.AllocHGlobal(SAMPLES_PER_FRAME * 2);
-            hdr[i] = Marshal.AllocHGlobal(HDR_SIZE);
-            for (int o = 0; o < HDR_SIZE; o++) Marshal.WriteByte(hdr[i], o, 0);
-            Marshal.WriteIntPtr(hdr[i], 0, data[i]);
-            Marshal.WriteInt32(hdr[i], 8, SAMPLES_PER_FRAME * 2);
-            waveOutPrepareHeader(hWave, hdr[i], HDR_SIZE);
-        }
+        try {
+            for (int i = 0; i < NB; i++) {
+                data[i] = Marshal.AllocHGlobal(SAMPLES_PER_FRAME * 2);
+                hdr[i] = Marshal.AllocHGlobal(HDR_SIZE);
+                for (int o = 0; o < HDR_SIZE; o++) Marshal.WriteByte(hdr[i], o, 0);
+                Marshal.WriteIntPtr(hdr[i], 0, data[i]);
+                Marshal.WriteInt32(hdr[i], 8, SAMPLES_PER_FRAME * 2);
+                hr = waveOutPrepareHeader(hWave, hdr[i], HDR_SIZE);
+                if (hr != 0) throw new InvalidOperationException("准备音频缓冲失败（错误 " + hr + "）");
+            }
+        } catch (Exception ex) { LastError = ex.Message; Stop(); return false; }
         running = true;
         thr = new Thread(Pump) { IsBackground = true, Name = "wavout" };
         thr.Start();
@@ -96,6 +126,7 @@ sealed class AudioOut {
 
     public void Enqueue(short[] samples) {
         lock (qlock) {
+            if (!running) return;
             q.Enqueue(samples);
             if (q.Count > 40) { q.Dequeue(); FramesDropped++; }  // drop oldest if backed up (>600 ms)
         }
@@ -103,15 +134,21 @@ sealed class AudioOut {
 
     public void Stop() {
         running = false;
-        if (thr != null) thr.Join(500);
+        if (thr != null) { thr.Join(); thr = null; }
         if (hWave != IntPtr.Zero) {
             waveOutReset(hWave);
             for (int i = 0; i < NB; i++) {
-                if (hdr[i] != IntPtr.Zero) { Marshal.FreeHGlobal(hdr[i]); Marshal.FreeHGlobal(data[i]); hdr[i] = IntPtr.Zero; }
+                if (hdr[i] != IntPtr.Zero) {
+                    waveOutUnprepareHeader(hWave, hdr[i], HDR_SIZE);
+                    Marshal.FreeHGlobal(hdr[i]); hdr[i] = IntPtr.Zero;
+                }
+                if (data[i] != IntPtr.Zero) { Marshal.FreeHGlobal(data[i]); data[i] = IntPtr.Zero; }
+                used[i] = false;
             }
             waveOutClose(hWave);
             hWave = IntPtr.Zero;
         }
+        lock (qlock) q.Clear();
     }
 
     void Pump() {
@@ -128,9 +165,10 @@ sealed class AudioOut {
                 int cnt = Math.Min(samples.Length, SAMPLES_PER_FRAME);
                 Marshal.Copy(samples, 0, data[freeIdx], cnt);
                 Marshal.WriteInt32(hdr[freeIdx], 8, cnt * 2);
-                waveOutWrite(hWave, hdr[freeIdx], HDR_SIZE);
-                used[freeIdx] = true;
-                FramesPlayed++;
+                int error = waveOutWrite(hWave, hdr[freeIdx], HDR_SIZE);
+                used[freeIdx] = error == 0;
+                if (error == 0) FramesPlayed++;
+                else { FramesDropped++; LastError = "音频写入失败（错误 " + error + "）"; }
             } else {
                 Thread.Sleep(3);
             }

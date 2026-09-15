@@ -49,7 +49,7 @@ static class E2E {
 
         // 1. endpoints
         var sw = new DeviceSwitcher();
-        if (!sw.FindTarget(cfg.cableCaptureName)) {
+        if (!sw.FindTarget(cfg.cableCaptureName, cfg.cableCaptureId)) {
             Console.WriteLine("FAIL: 未找到录音设备 \"" + cfg.cableCaptureName + "\" (VB-CABLE 未安装或音频栈异常)");
             return 1;
         }
@@ -70,7 +70,8 @@ static class E2E {
         sw.SwitchToTarget();
         string during = DeviceSwitcher.CurrentDefaultCaptureName();
         // The cable may already be the default microphone before the test.
-        bool switched = during != null && during.IndexOf(cfg.cableCaptureName, StringComparison.OrdinalIgnoreCase) >= 0;
+        var selectedCapture = AudioDevices.Resolve(DeviceSwitcher.ListCaptureEndpoints(), cfg.cableCaptureName, cfg.cableCaptureId);
+        bool switched = selectedCapture != null && string.Equals(during, selectedCapture.Name, StringComparison.OrdinalIgnoreCase);
         Console.WriteLine("[2] 默认麦克风: \"" + before + "\" -> \"" + during + "\" " + (switched ? "OK" : "(目标不匹配!)"));
         if (!switched) { sw.Restore(); Console.WriteLine("FAIL: 默认麦克风切换未生效"); return 1; }
 
@@ -169,20 +170,14 @@ static class E2E {
     public static int Run(string[] args) {
         // find cable render index first (stored in cableIdxFound for waveOutOpen)
         var cfg = Config.Load();
-        uint n = waveOutGetNumDevs();
-        bool found = false;
-        for (uint i = 0; i < n; i++) {
-            var c = new Caps();
-            waveOutGetDevCaps(i, ref c, Marshal.SizeOf(c));
-            if (c.name != null && c.name.IndexOf(cfg.cableRenderName, StringComparison.OrdinalIgnoreCase) >= 0) {
-                cableIdxFound = i; found = true;
-            }
-        }
-        if (!found) {
-            Console.WriteLine("FAIL: 未找到播放设备 \"" + cfg.cableRenderName + "\" (waveOut 设备数 " + n + ")");
-            Console.WriteLine("      安装 VB-CABLE (setup\\install-vbcable.cmd) 后重试；若刚装完请检查音频服务");
+        var devices = AudioOut.ListRenderEndpoints();
+        var selected = AudioDevices.Resolve(devices, cfg.cableRenderName, cfg.cableRenderId);
+        if (selected == null) {
+            Console.WriteLine("FAIL: 所选播放设备未找到或不唯一：" + cfg.cableRenderName);
+            Console.WriteLine("      请在连接与语音 → 选择音频设备中设置。");
             return 1;
         }
+        cableIdxFound = selected.WaveId;
         return Main2(args);
     }
 }

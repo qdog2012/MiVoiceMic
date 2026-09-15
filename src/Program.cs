@@ -93,6 +93,20 @@ static class Screenshot {
         MacTheme.Init();
         var cfg = Config.Load();
         var app = new App(cfg);              // constructed but not Run(): no BLE, no hooks
+        if (what == "audio") {
+            using (var dialog = new AudioDeviceDialog(app)) {
+                dialog.StartPosition = System.Windows.Forms.FormStartPosition.Manual;
+                dialog.Location = new System.Drawing.Point(-32000, -32000);
+                dialog.Show();
+                System.Windows.Forms.Application.DoEvents();
+                using (var bmp = new System.Drawing.Bitmap(dialog.Width, dialog.Height)) {
+                    dialog.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, dialog.Width, dialog.Height));
+                    bmp.Save(System.IO.Path.Combine(outDir, "shot_audio.png"), System.Drawing.Imaging.ImageFormat.Png);
+                }
+                dialog.Close();
+            }
+            return 0;
+        }
         using (var form = new MainWindow(app)) {
             form.StartPosition = System.Windows.Forms.FormStartPosition.Manual;
             form.Location = new System.Drawing.Point(-32000, -32000);   // offscreen: force full layout/paint

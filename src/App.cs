@@ -11,12 +11,12 @@ sealed class App : BleVoiceLink.IHandler {
     readonly Config cfg;
     readonly BleVoiceLink link;
     readonly AdpcmDecoder decoder;
-    readonly AudioOut audioOut = new AudioOut();
-    readonly DeviceSwitcher switcher = new DeviceSwitcher();
+    AudioOut audioOut = new AudioOut();
+    DeviceSwitcher switcher = new DeviceSwitcher();
     HotkeyInjector injector;
 
     // key/voice action worker (never inject SendInput from hook or WinRT threads)
-    enum KeyActionKind { VoiceDown, VoiceUp, Test }
+    enum KeyActionKind { VoiceDown, VoiceUp, Test, AudioDevices }
     sealed class KeyAction {
         public KeyActionKind Kind;
         public long Generation;
@@ -24,6 +24,8 @@ sealed class App : BleVoiceLink.IHandler {
         public bool SwitchMic;
         public int LeadMs;
         public Action<string> TestProgress;
+        public AudioDeviceInfo Render, Capture;
+        public System.Threading.Tasks.TaskCompletionSource<string> Completion;
     }
     readonly BlockingCollection<KeyAction> keyQueue = new BlockingCollection<KeyAction>();
     Thread keyWorker;
@@ -45,8 +47,10 @@ sealed class App : BleVoiceLink.IHandler {
     long framesDecoded;
     List<short> dumpBuffer;
     DateTime lastAudioRetry = DateTime.MinValue;   // late-attach: VB-CABLE may be installed while we run
+    bool testTonePlaying;
 
     public bool AudioOk { get; private set; }
+    public string AudioError { get { return audioOut.LastError; } }
     public bool SwitcherOk { get { return switcher.TargetFound; } }
     public Config Config { get { return cfg; } }
     public bool IsRunning { get { return keyWorker != null && !shuttingDown; } }
@@ -56,7 +60,7 @@ sealed class App : BleVoiceLink.IHandler {
         decoder = new AdpcmDecoder(cfg.agc, cfg.gainDb);
         injector = new HotkeyInjector(cfg.hotkey.keys, cfg.hotkey.mode);
         injectionEnabled = cfg.hotkeyEnabled;
-        keySession = new VoiceKeySession(switcher.Restore);
+        keySession = new VoiceKeySession(delegate { switcher.Restore(); });
         link = new BleVoiceLink(cfg, this);
     }
 
@@ -65,16 +69,16 @@ sealed class App : BleVoiceLink.IHandler {
         Log.Info("config: " + Config.ConfigPath);
 
         // 1. cable render side
-        AudioOk = audioOut.Start(cfg.cableRenderName, 16000);
+        AudioOk = audioOut.Start(cfg.cableRenderName, 16000, cfg.cableRenderId);
         if (!AudioOk) {
-            Log.Error("[AUDIO] 未找到虚拟声卡 \"" + cfg.cableRenderName + "\" - 请安装 VB-CABLE (见 README)");
-            Log.Error("[AUDIO] 无声卡模式下仍可用：热键注入照常，但语音将使用电脑自带麦克风");
+            Log.Error("[AUDIO] " + audioOut.LastError + "；请在连接与语音 → 选择音频设备中设置");
+            Log.Error("[AUDIO] 遥控器声音未送入输入法；热键图标和调试录音正常不代表音频输出正常");
         } else {
             Log.Info("[AUDIO] 推流目标: " + audioOut.DeviceUsed);
         }
 
         // 2. cable capture side (default-mic switching)
-        bool capOk = switcher.FindTarget(cfg.cableCaptureName);
+        bool capOk = switcher.FindTarget(cfg.cableCaptureName, cfg.cableCaptureId);
         if (!capOk) Log.Warn("[AUDIO] 未找到录音设备 \"" + cfg.cableCaptureName + "\" - 说话期间将不切换默认麦克风");
 
         // 3. hotkey
@@ -138,21 +142,81 @@ sealed class App : BleVoiceLink.IHandler {
     /// Runtime gain change from the settings UI.
     public void SetAudioGain(bool agcOn, double gainDb) { lock (voiceGate) decoder.SetGain(agcOn, gainDb); }
 
+    // Serialize device changes after key-up/default-mic restoration. The UI
+    // awaits completion without blocking the window or the key worker.
+    public System.Threading.Tasks.Task<string> SetAudioDevices(AudioDeviceInfo render, AudioDeviceInfo capture) {
+        var completion = new System.Threading.Tasks.TaskCompletionSource<string>();
+        lock (voiceGate) {
+            if (shuttingDown || keyWorker == null) completion.SetResult("程序未运行，无法应用音频设备。");
+            else if (talking) completion.SetResult("请先松开语音键，再应用音频设备。");
+            else {
+                session.Stop();
+                keyQueue.Add(new KeyAction { Kind = KeyActionKind.AudioDevices, Render = render, Capture = capture, Completion = completion });
+            }
+        }
+        return completion.Task;
+    }
+
+    string ConfigureAudioDevices(AudioDeviceInfo render, AudioDeviceInfo capture) {
+        lock (voiceGate) {
+            if (shuttingDown || talking) return "请先结束说话，再应用音频设备。";
+            if (render == null || capture == null || !render.Available || !capture.Available)
+                return "请选择可用的播放端和录音端。";
+            var nextOutput = new AudioOut();
+            var nextSwitcher = new DeviceSwitcher();
+            string oldRender = cfg.cableRenderName, oldCapture = cfg.cableCaptureName;
+            string oldRenderId = cfg.cableRenderId, oldCaptureId = cfg.cableCaptureId;
+            try {
+                if (!nextSwitcher.FindTarget(capture.Name, capture.Id)) return "录音端已不可用，请刷新设备列表。";
+                if (!nextOutput.Start(render.Name, 16000, render.Id)) return nextOutput.LastError;
+                cfg.cableRenderName = render.Name; cfg.cableRenderId = render.Id ?? "";
+                cfg.cableCaptureName = capture.Name; cfg.cableCaptureId = capture.Id ?? "";
+                try { cfg.SaveOrThrow(); }
+                catch {
+                    cfg.cableRenderName = oldRender; cfg.cableCaptureName = oldCapture;
+                    cfg.cableRenderId = oldRenderId; cfg.cableCaptureId = oldCaptureId;
+                    throw;
+                }
+                var previous = audioOut;
+                audioOut = nextOutput; nextOutput = null;
+                switcher = nextSwitcher;
+                AudioOk = true;
+                previous.Stop();
+                Log.Info("[AUDIO] 设备设置已保存并生效：" + render.Name + " → " + capture.Name);
+                UiState.SetLevel(0);
+                return null;
+            } finally { if (nextOutput != null) nextOutput.Stop(); }
+        }
+    }
+
     /// Push 1 s of 440 Hz tone through the cable so the user can verify the
     /// audio path end to end (mute the real mic first if unsure).
     public void PlayTestTone() {
-        if (!AudioOk) { Log.Warn("[AUDIO] 测试音未播放：未找到 " + cfg.cableRenderName); return; }
-        const int sr = 16000, seg = 320;
-        for (int off = 0; off < sr; off += seg) {
-            var buf = new short[seg];
-            for (int i = 0; i < seg; i++) {
-                int t = off + i;
-                double env = Math.Min(1.0, Math.Min(t / 800.0, (sr - t) / 1600.0));
-                buf[i] = (short)(11000 * env * Math.Sin(2 * Math.PI * 440 * t / sr));
-            }
-            audioOut.Enqueue(buf);
+        AudioOut output;
+        lock (voiceGate) {
+            if (!AudioOk || talking || testTonePlaying || shuttingDown) { Log.Warn("[AUDIO] 测试音未播放：请先选择可用设备并结束说话"); return; }
+            output = audioOut;
+            testTonePlaying = true;
         }
-        Log.Info("[AUDIO] 已发送 1 秒测试音到 " + audioOut.DeviceUsed);
+        ThreadPool.QueueUserWorkItem(delegate {
+            try {
+                const int sr = 16000, seg = 240;
+                for (int off = 0; off < sr; off += seg) {
+                    var buf = new short[Math.Min(seg, sr - off)];
+                    for (int i = 0; i < buf.Length; i++) {
+                        int t = off + i;
+                        double env = Math.Min(1.0, Math.Min(t / 800.0, (sr - t) / 1600.0));
+                        buf[i] = (short)(11000 * env * Math.Sin(2 * Math.PI * 440 * t / sr));
+                    }
+                    lock (voiceGate) {
+                        if (shuttingDown || talking || audioOut != output) return;
+                        output.Enqueue(buf);
+                    }
+                    Thread.Sleep(15);
+                }
+                Log.Info("[AUDIO] 已发送 1 秒测试音到 " + output.DeviceUsed);
+            } finally { lock (voiceGate) testTonePlaying = false; }
+        });
     }
 
     /// Re-apply config changes that can take effect at runtime.
@@ -187,8 +251,13 @@ sealed class App : BleVoiceLink.IHandler {
                 } else {
                     keySession.End();
                     if (act.Kind == KeyActionKind.Test) RunHotkeyTest(act);
+                    if (act.Kind == KeyActionKind.AudioDevices)
+                        act.Completion.TrySetResult(ConfigureAudioDevices(act.Render, act.Capture));
                 }
-            } catch (Exception ex) { Log.Error("[KEY] worker: " + ex.Message); }
+            } catch (Exception ex) {
+                Log.Error("[KEY] worker: " + ex.Message);
+                if (act.Completion != null) act.Completion.TrySetResult("应用失败：" + ex.Message);
+            }
         }
         try { keySession.End(); } catch (Exception ex) { Log.Error("[KEY] cleanup: " + ex.Message); }
     }
@@ -274,10 +343,10 @@ sealed class App : BleVoiceLink.IHandler {
         if ((DateTime.Now - lastAudioRetry).TotalSeconds < 30) return;
         lastAudioRetry = DateTime.Now;
         if (!AudioOk) {
-            AudioOk = audioOut.Start(cfg.cableRenderName, 16000);
+            AudioOk = audioOut.Start(cfg.cableRenderName, 16000, cfg.cableRenderId);
             if (AudioOk) Log.Info("[AUDIO] late-attach OK (" + reason + "): " + audioOut.DeviceUsed);
         }
-        if (!switcher.TargetFound && switcher.FindTarget(cfg.cableCaptureName))
+        if (!switcher.TargetFound && switcher.FindTarget(cfg.cableCaptureName, cfg.cableCaptureId))
             Log.Info("[AUDIO] late-attach capture OK (" + reason + ")");
       }
     }

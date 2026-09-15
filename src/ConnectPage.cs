@@ -61,7 +61,7 @@ class ConnectPage : MacPage {
     MacSegmented presetSeg, modeSeg;
     MacToggle agcToggle, micToggle, dumpToggle, f5Toggle, autoPairToggle, autoStartToggle;
     MacSlider gainSlider;
-    MacButton reconnectBtn, testHotkeyBtn, testToneBtn;
+    MacButton reconnectBtn, testHotkeyBtn, testToneBtn, audioDevicesBtn;
     ComboCaptureBox comboBox;
     MacTextBox leadBox;
     string gainText = "+0 dB";
@@ -117,6 +117,11 @@ class ConnectPage : MacPage {
         };
         testToneBtn = new MacButton("发送 1 秒测试音", false, true) { Width = MacTheme.S(150) };
         testToneBtn.Clicked += delegate { App.PlayTestTone(); };
+        audioDevicesBtn = new MacButton("选择音频设备", false, true) { Width = MacTheme.S(140) };
+        audioDevicesBtn.Clicked += delegate {
+            using (var dialog = new AudioDeviceDialog(App)) dialog.ShowDialog(this);
+            Invalidate(true);
+        };
 
         micToggle = new MacToggle(App.Config.switchDefaultMic);
         micToggle.Toggled += delegate { App.Config.switchDefaultMic = micToggle.On; Save(); };
@@ -142,6 +147,7 @@ class ConnectPage : MacPage {
 
         Controls.Add(presetSeg); Controls.Add(comboBox); Controls.Add(modeSeg); Controls.Add(leadBox);
         Controls.Add(testHotkeyBtn); Controls.Add(testToneBtn);
+        Controls.Add(audioDevicesBtn);
         Controls.Add(agcToggle); Controls.Add(gainSlider);
         Controls.Add(micToggle); Controls.Add(dumpToggle);
         Controls.Add(f5Toggle); Controls.Add(autoPairToggle); Controls.Add(autoStartToggle);
@@ -290,6 +296,7 @@ class ConnectPage : MacPage {
         agcToggle.Location = new Point(rightX + rightW - MacTheme.S(58), ay + MacTheme.S(34) - MacTheme.S(2));
         gainSlider.Bounds = new Rectangle(cx + MacTheme.S(140), ay + MacTheme.S(84), cw - MacTheme.S(140) - MacTheme.S(64), MacTheme.S(22));
         testToneBtn.Location = new Point(cx, ay + MacTheme.S(114));
+        audioDevicesBtn.Location = new Point(cx + MacTheme.S(160), ay + MacTheme.S(114));
         micToggle.Location = new Point(rightX + rightW - MacTheme.S(58), ay + MacTheme.S(148) - MacTheme.S(2));
         dumpToggle.Location = new Point(rightX + rightW - MacTheme.S(58), ay + MacTheme.S(186) - MacTheme.S(2));
 
@@ -404,6 +411,9 @@ class ConnectPage : MacPage {
 
     void PaintAudioContent(Graphics g) {
         int w = audioCard.Width;
+        if (App.IsRunning && (!App.AudioOk || App.AudioError != null || !App.SwitcherOk))
+            Gfx.Text(g, "设备不可用 · 请重新选择", smallFont, MacTheme.Red,
+                new RectangleF(w - MacTheme.S(186), MacTheme.S(13), MacTheme.S(170), MacTheme.S(18)), StringAlignment.Near);
         Gfx.Text(g, "自适应增益 (AGC)", bodyFont, MacTheme.TextPrimary,
             new RectangleF(MacTheme.S(16), MacTheme.S(36), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
         Gfx.Text(g, "推荐开启；拖动下面的滑条会自动关闭 AGC", smallFont, MacTheme.TextTertiary,
@@ -414,7 +424,7 @@ class ConnectPage : MacPage {
             new RectangleF(w - MacTheme.S(70), MacTheme.S(86), MacTheme.S(54), MacTheme.S(20)), StringAlignment.Near);
         Gfx.Text(g, "说话时自动切换默认麦克风", bodyFont, MacTheme.TextPrimary,
             new RectangleF(MacTheme.S(16), MacTheme.S(150), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);
-        Gfx.Text(g, "切到 " + App.Config.cableCaptureName + "，松开后恢复原麦克风", smallFont, MacTheme.TextTertiary,
+        Gfx.Text(g, "切到所选录音端，松开后恢复原麦克风", smallFont, MacTheme.TextTertiary,
             new RectangleF(MacTheme.S(16), MacTheme.S(170), w - MacTheme.S(110), MacTheme.S(16)), StringAlignment.Near);
         Gfx.Text(g, "保存语音录音（调试）", bodyFont, MacTheme.TextPrimary,
             new RectangleF(MacTheme.S(16), MacTheme.S(188), w - MacTheme.S(110), MacTheme.S(20)), StringAlignment.Near);

@@ -22,6 +22,7 @@ class CheckItem {
 static class EnvChecks {
     public static List<CheckItem> Run(App app = null) {
         var items = new List<CheckItem>();
+        var cfg = app == null ? Config.Load() : app.Config;
 
         // 1. Bluetooth adapter
         var bt = new CheckItem { Title = "蓝牙适配器" };
@@ -35,33 +36,38 @@ static class EnvChecks {
         items.Add(bt);
 
         // Paired and connected are separate checks, based on the same system snapshot.
-        var report = BleVoiceLink.ReadRemoteConnection(app == null ? Config.Load() : app.Config);
+        var report = BleVoiceLink.ReadRemoteConnection(cfg);
         items.Add(PairingCheck(report));
         items.Add(ConnectionCheck(report, RuntimeState(app)));
 
         // 3. VB-CABLE render side
         var render = new CheckItem { Title = "虚拟声卡（播放端）" };
-        var renderNames = AudioOut.ListRenderDevices();
-        bool cableRender = false;
-        foreach (string n in renderNames) if (n != null && n.IndexOf("CABLE", StringComparison.OrdinalIgnoreCase) >= 0) cableRender = true;
-        render.State = renderNames.Count == 0 ? CheckState.Warn : (cableRender ? CheckState.Ok : CheckState.Fail);
-        if (!cableRender) render.Lines.Add("未找到 CABLE 播放端 — 请安装 VB-CABLE（setup\\install-vbcable.cmd）");
-        else render.Lines.Add("CABLE Input 就绪");
-        if (renderNames.Count == 0) render.Lines.Add("系统报告 0 个播放设备，音频栈异常（尝试重启音频服务或重启电脑）");
+        try {
+            var devices = AudioOut.ListRenderEndpoints();
+            var selected = AudioDevices.Resolve(devices, cfg.cableRenderName, cfg.cableRenderId);
+            render.State = selected == null ? CheckState.Fail : CheckState.Ok;
+            render.Lines.Add(selected == null ? "所选播放端未找到或不唯一：" + cfg.cableRenderName : "所选播放端：" + selected.Name);
+            if (selected == null) render.Lines.Add("请在“连接与语音 → 选择音频设备”中重新选择。");
+            else if (app != null && app.IsRunning && (!app.AudioOk || app.AudioError != null)) {
+                render.State = CheckState.Fail;
+                render.Lines.Add(app.AudioError ?? "设备存在，但程序未成功打开音频输出。请重新选择并应用。");
+            }
+            if (devices.Count == 0) render.Lines.Add("系统报告 0 个播放设备，检查驱动和音频服务。");
+        } catch (Exception ex) { render.State = CheckState.Fail; render.Lines.Add("枚举失败：" + ex.Message); }
         items.Add(render);
 
         // 4. VB-CABLE capture side
         var capture = new CheckItem { Title = "虚拟声卡（录音端）" };
-        bool cableCapture = false;
         try {
-            foreach (var ep in DeviceSwitcher.ListCaptureEndpoints())
-                if (ep.Name != null && ep.Name.IndexOf("CABLE", StringComparison.OrdinalIgnoreCase) >= 0) cableCapture = true;
+            var selected = AudioDevices.Resolve(DeviceSwitcher.ListCaptureEndpoints(), cfg.cableCaptureName, cfg.cableCaptureId);
+            capture.State = selected == null ? CheckState.Fail : CheckState.Ok;
+            capture.Lines.Add(selected == null ? "所选录音端未找到或不唯一：" + cfg.cableCaptureName : "所选录音端：" + selected.Name);
+            if (selected == null) capture.Lines.Add("请在“连接与语音 → 选择音频设备”中重新选择。");
             capture.Lines.Add("当前默认麦克风: " + DeviceSwitcher.CurrentDefaultCaptureName());
         } catch (Exception ex) {
+            capture.State = CheckState.Fail;
             capture.Lines.Add("枚举失败: " + ex.Message);
         }
-        capture.State = cableCapture ? CheckState.Ok : CheckState.Fail;
-        if (!cableCapture) capture.Lines.Add("未找到 CABLE 录音端（与播放端同一驱动，缺一不可）");
         items.Add(capture);
 
         // 5. WeType

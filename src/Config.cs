@@ -41,6 +41,8 @@ class Config {
     // audio
     public string cableRenderName = "CABLE Input";    // waveOut target (render side of the loopback cable)
     public string cableCaptureName = "CABLE Output";  // default-mic switch target (capture side)
+    public string cableRenderId = "";     // stable endpoint IDs selected in the UI; empty = legacy name matching
+    public string cableCaptureId = "";
     public bool switchDefaultMic = true;  // auto-switch default capture device while talking
     public int switchLeadMs = 120;        // wait after switching default mic before injecting hotkey
     public bool agc = true;               // adaptive gain (recommended)
@@ -86,6 +88,8 @@ class Config {
             cfg.autoPair      = GetBool(dict, "autoPair", cfg.autoPair);
             cfg.cableRenderName = GetStr(dict, "cableRenderName", cfg.cableRenderName);
             cfg.cableCaptureName = GetStr(dict, "cableCaptureName", cfg.cableCaptureName);
+            cfg.cableRenderId = GetStr(dict, "cableRenderId", cfg.cableRenderId);
+            cfg.cableCaptureId = GetStr(dict, "cableCaptureId", cfg.cableCaptureId);
             cfg.switchDefaultMic = GetBool(dict, "switchDefaultMic", cfg.switchDefaultMic);
             cfg.switchLeadMs  = GetInt(dict, "switchLeadMs", cfg.switchLeadMs);
             cfg.agc           = GetBool(dict, "agc", cfg.agc);
@@ -131,6 +135,11 @@ class Config {
     static readonly object saveGate = new object();
 
     public void Save() {
+        try { SaveOrThrow(); }
+        catch (Exception ex) { Log.Error("config: save failed: " + ex.Message); }
+    }
+
+    public void SaveOrThrow() {
       lock (saveGate) {
         var ser = new JavaScriptSerializer();
         var root = new Dictionary<string, object>();
@@ -139,6 +148,8 @@ class Config {
         root["autoPair"] = autoPair;
         root["cableRenderName"] = cableRenderName;
         root["cableCaptureName"] = cableCaptureName;
+        root["cableRenderId"] = cableRenderId;
+        root["cableCaptureId"] = cableCaptureId;
         root["switchDefaultMic"] = switchDefaultMic;
         root["switchLeadMs"] = switchLeadMs;
         root["agc"] = agc;
@@ -154,11 +165,13 @@ class Config {
         root["hotkeyEnabled"] = hotkeyEnabled;
         root["keymap"] = keymap;
         root["stats"] = stats;
+        string path = ConfigPath;
+        string temporary = path + ".tmp-" + Guid.NewGuid().ToString("N");
         try {
-            File.WriteAllText(ConfigPath, ser.Serialize(root), System.Text.Encoding.UTF8);
-        } catch (Exception ex) {
-            Log.Error("config: save failed: " + ex.Message);
-        }
+            File.WriteAllText(temporary, ser.Serialize(root), System.Text.Encoding.UTF8);
+            if (File.Exists(path)) File.Replace(temporary, path, null);
+            else File.Move(temporary, path);
+        } finally { if (File.Exists(temporary)) File.Delete(temporary); }
       }
     }
 

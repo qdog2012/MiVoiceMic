@@ -22,6 +22,7 @@ static class SelfTest {
         TestSyncResetsDecoder();
         TestVkNames();
         TestConfigRoundtrip();
+        TestAudioDeviceSelection();
         TestWavWriter();
         TestF5Blocker();
         TestDriverF5Passthrough();
@@ -342,16 +343,47 @@ static class SelfTest {
             cfg.agc = false;
             cfg.gainDb = 12;
             cfg.blockF5 = false;
+            cfg.cableRenderName = "CABLE In 16 Ch";
+            cfg.cableRenderId = "render-endpoint";
+            cfg.cableCaptureId = "capture-endpoint";
             cfg.Save();
             var loaded = Config.Load();
             Check(loaded.hotkey.mode == "tap" && loaded.hotkey.keys.Count == 2 && loaded.hotkey.keys[0] == "LWIN",
                 "config json roundtrip hotkey");
             Check(!loaded.agc && Math.Abs(loaded.gainDb - 12) < 0.001, "config json roundtrip audio");
             Check(!loaded.blockF5, "config json roundtrip blockF5");
+            Check(loaded.cableRenderName == cfg.cableRenderName && loaded.cableRenderId == cfg.cableRenderId &&
+                loaded.cableCaptureId == cfg.cableCaptureId, "config: selected audio endpoints survive restart");
         } finally {
             Config.OverridePath = prevOverride;
             try { File.Delete(tmp); } catch { }
         }
+    }
+
+    static void TestAudioDeviceSelection() {
+        var cable = new AudioDeviceInfo { Id = "cable", Name = "CABLE In 16 Ch (VB-Audio Virtual Cable)",
+            LegacyName = "CABLE In 16 Ch (VB-Audio Virtua", WaveId = 1 };
+        var speaker = new AudioDeviceInfo { Id = "speaker", Name = "Speakers", WaveId = 0 };
+        var devices = new List<AudioDeviceInfo> { speaker, cable };
+        Check(AudioDevices.Resolve(devices, "CABLE Input", "") == null,
+            "audio: another CABLE device does not make a missing configured output valid");
+        Check(AudioDevices.Resolve(devices, "CABLE In 16 Ch", "") == cable,
+            "audio: legacy partial name resolves the installed 16-channel cable");
+        Check(AudioDevices.Resolve(devices, cable.LegacyName, "") == cable,
+            "audio: old truncated waveOut names remain compatible");
+        cable.Name = "Renamed remote cable"; cable.WaveId = 0; devices.Reverse();
+        Check(AudioDevices.Resolve(devices, "CABLE In 16 Ch", "CABLE") == cable,
+            "audio: endpoint ID survives rename and enumeration reorder");
+        Check(AudioDevices.Resolve(devices, "Speakers", "missing") == null,
+            "audio: missing saved ID never falls back to a different endpoint with the old name");
+        devices.Add(new AudioDeviceInfo { Id = "speaker-2", Name = "Speakers" });
+        Check(AudioDevices.Resolve(devices, "Speakers", "") == null,
+            "audio: duplicate friendly names require an explicit endpoint selection");
+        Check(AudioDevices.Resolve(devices, "", "") == null,
+            "audio: empty config must not select an arbitrary sound device");
+        cable.Available = false;
+        Check(AudioDevices.Resolve(devices, cable.Name, cable.Id) == null,
+            "audio: disconnected placeholder cannot become a usable selection");
     }
 
     static void TestWavWriter() {

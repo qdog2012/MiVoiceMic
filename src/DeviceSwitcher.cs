@@ -56,23 +56,26 @@ sealed class DeviceSwitcher {
     string targetId;           // cable capture endpoint id
     string savedDefault;       // endpoint id to restore
 
-    public sealed class EndpointInfo {
-        public string Id; public string Name;
-    }
+    public static List<AudioDeviceInfo> ListCaptureEndpoints() { return ListEndpoints(EDataFlow.eCapture); }
+    public static List<AudioDeviceInfo> ListRenderEndpoints() { return ListEndpoints(EDataFlow.eRender); }
 
-    public static List<EndpointInfo> ListCaptureEndpoints() {
-        var result = new List<EndpointInfo>();
+    static List<AudioDeviceInfo> ListEndpoints(EDataFlow flow) {
+        var result = new List<AudioDeviceInfo>();
         RunSta(delegate {
             var e = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_MMDeviceEnumerator));
             IMMDeviceCollection c;
-            e.EnumAudioEndpoints(EDataFlow.eCapture, EDeviceState.ACTIVE, out c);
+            e.EnumAudioEndpoints(flow, EDeviceState.ACTIVE, out c);
             uint n; c.GetCount(out n);
             for (uint i = 0; i < n; i++) {
                 IMMDevice d; c.Item(i, out d);
                 string id; d.GetId(out id);
                 IPropertyStore ps; d.OpenPropertyStore(0, out ps);
-                result.Add(new EndpointInfo { Id = id, Name = ReadName(ps) });
+                result.Add(new AudioDeviceInfo { Id = id, Name = ReadName(ps) });
+                Marshal.ReleaseComObject(ps);
+                Marshal.ReleaseComObject(d);
             }
+            Marshal.ReleaseComObject(c);
+            Marshal.ReleaseComObject(e);
         });
         return result;
     }
@@ -88,15 +91,15 @@ sealed class DeviceSwitcher {
         return name;
     }
 
-    static string ReadName(IPropertyStore ps) {
-        var key = new PROPERTYKEY { fmtid = PKEY_Device_FriendlyName, pid = 2 };
+    static string ReadName(IPropertyStore ps, uint property = 14) {
+        var key = new PROPERTYKEY { fmtid = PKEY_Device_FriendlyName, pid = property };
         IntPtr pv = Marshal.AllocCoTaskMem(40);
         for (int i = 0; i < 40; i++) Marshal.WriteByte(pv, i, 0);
         try {
             ps.GetValue(ref key, pv);
             short vt = Marshal.ReadInt16(pv);
             if (vt == 31) return Marshal.PtrToStringUni(Marshal.ReadIntPtr(pv, 8));
-            return null;
+            return property == 14 ? ReadName(ps, 2) : null;
         } finally { PropVariantClear(pv); Marshal.FreeCoTaskMem(pv); }
     }
 
@@ -109,14 +112,13 @@ sealed class DeviceSwitcher {
     }
 
     /// Find the capture endpoint whose friendly name contains nameContains. Call at startup.
-    public bool FindTarget(string nameContains) {
+    public bool FindTarget(string nameContains, string endpointId = null) {
         try {
-            foreach (var ep in ListCaptureEndpoints()) {
-                if (ep.Name != null && ep.Name.IndexOf(nameContains, StringComparison.OrdinalIgnoreCase) >= 0) {
-                    targetId = ep.Id;
-                    Log.Info("[DEV] capture target: " + ep.Name);
-                    return true;
-                }
+            var ep = AudioDevices.Resolve(ListCaptureEndpoints(), nameContains, endpointId);
+            if (ep != null) {
+                targetId = ep.Id;
+                Log.Info("[DEV] capture target: " + ep.Name);
+                return true;
             }
         } catch (Exception ex) { Log.Error("[DEV] enumerate failed: " + ex.Message); }
         targetId = null;
