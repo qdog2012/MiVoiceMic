@@ -10,6 +10,8 @@ class MacSlider : MacWidget {
     public int Min = -24, Max = 24, Value_;
     public bool EnabledLook = true;
     public event Action Changed;
+    public event Action ChangeCompleted;
+    bool dragging;
 
     public MacSlider(int initial) { Value_ = initial; Height = MacTheme.S(22); }
 
@@ -28,16 +30,40 @@ class MacSlider : MacWidget {
 
     protected override void OnMouseDown(MouseEventArgs e) {
         base.OnMouseDown(e);
-        Value_ = PosFromX(e.X);
-        InvalidateSafe();
-        if (Changed != null) Changed();
+        if (e.Button != MouseButtons.Left) return;
+        dragging = true;
+        Capture = true;
+        SetValueFromX(e.X, true);
     }
     protected override void OnMouseMove(MouseEventArgs e) {
         base.OnMouseMove(e);
-        if (e.Button != MouseButtons.Left) return;
-        Value_ = PosFromX(e.X);
+        if (!dragging || e.Button != MouseButtons.Left) return;
+        SetValueFromX(e.X, false);
+    }
+    protected override void OnMouseUp(MouseEventArgs e) {
+        base.OnMouseUp(e);
+        if (!dragging || e.Button != MouseButtons.Left) return;
+        SetValueFromX(e.X, false);
+        CompleteChange();
+    }
+    protected override void OnMouseCaptureChanged(EventArgs e) {
+        base.OnMouseCaptureChanged(e);
+        if (!Capture) CompleteChange();
+    }
+
+    void SetValueFromX(int x, bool force) {
+        int next = PosFromX(x);
+        if (!force && next == Value_) return;
+        Value_ = next;
         InvalidateSafe();
         if (Changed != null) Changed();
+    }
+
+    void CompleteChange() {
+        if (!dragging) return;
+        dragging = false;
+        Capture = false;
+        if (ChangeCompleted != null) ChangeCompleted();
     }
 
     protected override void OnPaint(PaintEventArgs e) {
@@ -65,6 +91,7 @@ class ConnectPage : MacPage {
     ComboCaptureBox comboBox;
     MacTextBox leadBox;
     string gainText = "+0 dB";
+    bool gainSavePending;
     readonly Font titleFont, cardHeadFont, bodyFont, smallFont;
 
     public ConnectPage(App app) : base(app) {
@@ -102,7 +129,8 @@ class ConnectPage : MacPage {
         agcToggle.Toggled += delegate {
             App.Config.agc = agcToggle.On;
             App.SetAudioGain(agcToggle.On, App.Config.gainDb);
-            Save(); RefreshAudioUI();
+            RefreshAudioUI();
+            SaveAudioGain();
         };
         gainSlider = new MacSlider((int)App.Config.gainDb);
         gainSlider.Changed += delegate {
@@ -111,10 +139,11 @@ class ConnectPage : MacPage {
                 agcToggle.On = false;
             }
             App.Config.gainDb = gainSlider.Value_;
+            gainSavePending = true;
+            RefreshAudioUI();
             App.SetAudioGain(App.Config.agc, App.Config.gainDb);
-            gainText = (gainSlider.Value_ >= 0 ? "+" : "") + gainSlider.Value_ + " dB";
-            Save();
         };
+        gainSlider.ChangeCompleted += delegate { if (gainSavePending) SaveAudioGain(); };
         testToneBtn = new MacButton("发送 1 秒测试音", false, true) { Width = MacTheme.S(150) };
         testToneBtn.Clicked += delegate { App.PlayTestTone(); };
         audioDevicesBtn = new MacButton("选择音频设备", false, true) { Width = MacTheme.S(140) };
@@ -169,6 +198,18 @@ class ConnectPage : MacPage {
 
     void Save() {
         try { App.Config.Save(); App.ApplyConfig(App.Config); } catch (Exception ex) { Log.Error("[UI] save: " + ex.Message); }
+    }
+
+    void SaveAudioGain() {
+        // Gain is already applied to the decoder. Do not rebuild hotkeys or
+        // key mappings, and write only once after a drag (including capture loss).
+        gainSavePending = false;
+        App.Config.Save();
+    }
+
+    protected override void Dispose(bool disposing) {
+        if (disposing && gainSavePending) SaveAudioGain();
+        base.Dispose(disposing);
     }
 
     int PresetIndex() {
@@ -262,7 +303,10 @@ class ConnectPage : MacPage {
     void RefreshAudioUI() {
         gainSlider.EnabledLook = true;                       // always adjustable now
         gainText = (gainSlider.Value_ >= 0 ? "+" : "") + gainSlider.Value_ + " dB";
-        Invalidate();
+        // The value is painted by the card, not by the slider or page.
+        audioCard.Invalidate();
+        agcToggle.Invalidate();
+        gainSlider.Invalidate();
     }
 
     // ---- layout ----------------------------------------------------------------
