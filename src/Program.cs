@@ -72,6 +72,7 @@ static class Program {
             using (var context = new TrayApplicationContext(main, instance, startInTray))
                 System.Windows.Forms.Application.Run(context);
         }
+        TrayIcon.Dispose();
         app.Shutdown();
 
         Log.Info("bye");

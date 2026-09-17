@@ -9,7 +9,7 @@ on:
       version:
         description: Existing release tag
         required: true
-        default: v1.0.7
+        default: v1.0.8
 
 env:
   RELEASE_VERSION: ${{ inputs.version || github.ref_name }}

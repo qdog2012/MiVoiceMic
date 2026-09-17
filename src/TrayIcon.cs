@@ -6,10 +6,88 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
+
+// A solid badge stays legible on both light and dark Windows taskbars.
+// Render at the actual small-icon size so two-digit percentages remain crisp.
+static class TrayBatteryIcon {
+    [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr handle);
+
+    public static bool HasBattery(int percent) { return percent >= 0 && percent <= 100; }
+    public static string Label(bool linked, int percent) {
+        return !linked ? "×" : HasBattery(percent) ? percent.ToString(CultureInfo.InvariantCulture) : "?";
+    }
+    public static Color BadgeColor(bool linked, int percent, int charging) {
+        if (!linked) return Color.FromArgb(99, 105, 115);
+        if (charging == 1) return Color.FromArgb(24, 128, 65);
+        if (!HasBattery(percent)) return Color.FromArgb(99, 105, 115);
+        if (percent <= 15) return Color.FromArgb(190, 36, 44);
+        if (percent <= 30) return Color.FromArgb(158, 87, 0);
+        return Color.FromArgb(30, 94, 190);
+    }
+    public static string Tooltip(bool linked, int percent, int charging, string status) {
+        string detail = !linked ? "未连接" : HasBattery(percent) ? "电量 " + percent + "%" : "电量读取中";
+        if (linked && charging == 1) detail += "（充电中）";
+        string text = "MiVoiceMic · " + detail + "\n" + (status ?? "");
+        return text.Length > 63 ? text.Substring(0, 60) + "..." : text;
+    }
+
+    public static Bitmap Render(bool linked, int percent, int charging, int size) {
+        size = Math.Max(16, Math.Min(64, size));
+        var bitmap = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bitmap)) {
+            g.Clear(Color.Transparent);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            float scale = size / 16f, diameter = 5 * scale;
+            using (var path = new GraphicsPath()) {
+                float edge = size - 1;
+                path.AddArc(0, 0, diameter, diameter, 180, 90);
+                path.AddArc(edge - diameter, 0, diameter, diameter, 270, 90);
+                path.AddArc(edge - diameter, edge - diameter, diameter, diameter, 0, 90);
+                path.AddArc(0, edge - diameter, diameter, diameter, 90, 90);
+                path.CloseFigure();
+                using (var brush = new SolidBrush(BadgeColor(linked, percent, charging))) g.FillPath(brush, path);
+            }
+            string label = Label(linked, percent);
+            float fontSize = (label.Length == 3 ? 8.5f : 11.5f) * scale;
+            using (var font = new Font("Segoe UI", fontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (var format = new StringFormat(StringFormat.GenericTypographic)) {
+                format.Alignment = StringAlignment.Center;
+                format.LineAlignment = StringAlignment.Center;
+                g.DrawString(label, font, Brushes.White, new RectangleF(0, 0, size - 1, size - 2 * scale), format);
+            }
+            if (linked && HasBattery(percent)) {
+                float width = size - 6 * scale;
+                using (var brush = new SolidBrush(Color.FromArgb(80, Color.White)))
+                    g.FillRectangle(brush, 3 * scale, size - 3 * scale, width, scale);
+                if (percent > 0) g.FillRectangle(Brushes.White, 3 * scale, size - 3 * scale, width * percent / 100f, scale);
+            }
+        }
+        return bitmap;
+    }
+
+    public static Icon Create(bool linked, int percent, int charging, int size) {
+        using (var bitmap = Render(linked, percent, charging, size)) {
+            IntPtr handle = bitmap.GetHicon();
+            try {
+                using (var borrowed = Icon.FromHandle(handle)) return (Icon)borrowed.Clone();
+            } finally { DestroyIcon(handle); }
+        }
+    }
+}
 
 static class TrayIcon {
     static NotifyIcon icon;
+    static Icon ownedIcon;
+    static Timer timer;
+    static string renderedKey;
+    static int renderedSize;
     static ToolStripMenuItem miStatus, miBattery, miBlockF5, miSwitchMic;
     static List<ToolStripMenuItem> presetItems = new List<ToolStripMenuItem>();
     static App app;
@@ -27,6 +105,7 @@ static class TrayIcon {
     static volatile bool dirty = true;
 
     public static NotifyIcon Create(App application) {
+        Dispose();
         app = application;
         var menu = new ContextMenuStrip();
 
@@ -66,27 +145,38 @@ static class TrayIcon {
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("退出", null, delegate { ExitApplication(); }));
 
-        System.Drawing.Icon trayIcon = null;
-        try { trayIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         icon = new NotifyIcon {
-            Icon = trayIcon ?? System.Drawing.SystemIcons.Information,
             Text = "MiVoiceMic - 小米遥控器语音",
             ContextMenuStrip = menu,
             Visible = true
         };
         icon.DoubleClick += delegate { Safe(ShowMain); };
 
-        var timer = new Timer { Interval = 800 };
-        timer.Tick += delegate { ApplyPending(); };
+        timer = new Timer { Interval = 800 };
+        timer.Tick += delegate { Safe(ApplyPending); };
         timer.Start();
         ApplyConfigChecks();
+        ApplyPending();
         return icon;
+    }
+
+    public static void Dispose() {
+        if (timer != null) { timer.Stop(); timer.Dispose(); timer = null; }
+        if (icon != null) {
+            var menu = icon.ContextMenuStrip;
+            icon.Visible = false; icon.Dispose(); icon = null;
+            if (menu != null) menu.Dispose();
+        }
+        if (ownedIcon != null) { ownedIcon.Dispose(); ownedIcon = null; }
+        presetItems.Clear();
+        renderedKey = null; renderedSize = 0;
+        dirty = true;
     }
 
     public static void ExitApplication() {
         // Release held hotkeys and restore audio before the updater replaces the executable.
         Safe(delegate { if (app != null) app.Shutdown(); });
-        if (icon != null) icon.Visible = false;
+        Dispose();
         Log.Close();
         Application.ExitThread();
         Environment.Exit(0);
@@ -167,8 +257,9 @@ static class TrayIcon {
     /// Called from any thread.
     public static void SetStatus(bool connected, string detail) {
         lock (gate) {
+            if (!connected || !linkedFlag) { battery = -1; charging = -1; }
             linkedFlag = connected;
-            string text = connected ? "已连接: " + detail : detail;
+            string text = connected ? "已连接: " + detail : (detail ?? "未连接");
             if (text.Length > 40) text = text.Substring(0, 40) + "...";
             statusText = text;
             dirty = true;
@@ -186,14 +277,28 @@ static class TrayIcon {
     }
 
     static void ApplyPending() {
-        if (!dirty) return;
+        if (icon == null) return;
+        int size = Math.Max(16, Math.Min(64, SystemInformation.SmallIconSize.Width));
+        if (!dirty && renderedSize == size) return;
         string st; bool linked; int bat; int chg;
         lock (gate) {
             st = statusText; linked = linkedFlag; bat = battery; chg = charging;
             dirty = false;
         }
         miStatus.Text = "状态: " + st;
-        if (bat >= 0) { miBattery.Visible = true; miBattery.Text = "电量: " + bat + "%" + (chg == 1 ? " (充电中)" : ""); }
+        miBattery.Visible = linked;
+        miBattery.Text = "电量: " + (TrayBatteryIcon.HasBattery(bat) ? bat + "%" : "读取中") + (chg == 1 ? " (充电中)" : "");
+        icon.Text = TrayBatteryIcon.Tooltip(linked, bat, chg, st);
+        string key = linked + ":" + bat + ":" + chg + ":" + size;
+        if (renderedKey != key) {
+            var next = TrayBatteryIcon.Create(linked, bat, chg, size);
+            try { icon.Icon = next; }
+            catch { next.Dispose(); dirty = true; throw; }
+            var previous = ownedIcon;
+            ownedIcon = next;
+            renderedKey = key; renderedSize = size;
+            if (previous != null) previous.Dispose();
+        }
     }
 }
 
